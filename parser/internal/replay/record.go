@@ -57,6 +57,10 @@ type Recorder struct {
 // NewRecorder samples every `every` ticks (2 at 64-tick = 32 samples/s = one video frame per sample).
 func NewRecorder(p dem.Parser, every int) *Recorder {
 	r := &Recorder{p: p, every: every}
+	// Same restart rule as the stats collector: a knife round is played, then the game restarts.
+	// Without this, a 7-kill knife round scores as an ace and becomes "Play of the match", and every
+	// round number in the clip caption is one too high.
+	p.RegisterEventHandler(func(events.MatchStart) { r.reset() })
 	p.RegisterEventHandler(func(events.RoundFreezetimeEnd) {
 		if !r.live() {
 			return
@@ -89,6 +93,14 @@ func NewRecorder(p dem.Parser, every int) *Recorder {
 	})
 	p.RegisterEventHandler(func(events.FrameDone) { r.sample() })
 	return r
+}
+
+// reset drops rounds collected before a (re)start. Density is kept: it is only the map silhouette
+// drawn from where players walked, so earlier samples are still good data.
+func (r *Recorder) reset() {
+	r.rec.Rounds = nil
+	r.cur = nil
+	r.n = 0
 }
 
 func (r *Recorder) live() bool {

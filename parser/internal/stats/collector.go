@@ -66,10 +66,14 @@ type Result struct {
 	TickRate float64   `json:"tickrate"`
 	Rounds   []Round   `json:"rounds"`
 	Players  []*Player `json:"players"`
+	// How many times the game restarted (knife round, LO3). Everything before the last one is
+	// discarded; reported so a round-count dispute can be diagnosed from the worker log alone.
+	Restarts int `json:"restarts"`
 }
 
 type Collector struct {
 	p          dem.Parser
+	restarts   int
 	rounds     []Round
 	players    map[uint64]*Player
 	cur        *Round
@@ -83,6 +87,7 @@ type Collector struct {
 
 func NewCollector(p dem.Parser) *Collector {
 	c := &Collector{p: p, players: map[uint64]*Player{}}
+	p.RegisterEventHandler(c.onMatchStart)
 	p.RegisterEventHandler(c.onRoundStart)
 	p.RegisterEventHandler(c.onFreezeEnd)
 	p.RegisterEventHandler(c.onKill)
@@ -90,6 +95,25 @@ func NewCollector(p dem.Parser) *Collector {
 	p.RegisterEventHandler(c.onFlashed)
 	p.RegisterEventHandler(c.onRoundEnd)
 	return c
+}
+
+// FACEIT and ESEA play a knife round for side choice and then restart the game, and servers LO3
+// before going live. Each restart fires MatchStart again, so everything collected before the LAST
+// one has to go: a counted knife round makes the round total disagree with the official score, and
+// its kills silently inflate every player's K/D, ADR and Rating 2.0.
+func (c *Collector) onMatchStart(events.MatchStart) { c.reset() }
+
+// reset drops all accumulated match state, keeping only the parser handle.
+func (c *Collector) reset() {
+	c.restarts++
+	c.rounds = nil
+	c.players = map[uint64]*Player{}
+	c.cur = nil
+	c.roundStart = 0
+	c.contributed = map[uint64]bool{}
+	c.died = map[uint64]float64{}
+	c.killerOf = map[uint64]uint64{}
+	c.clutch = map[common.Team]*Clutch{}
 }
 
 func (c *Collector) live() bool {
@@ -297,5 +321,5 @@ func (c *Collector) Result(mapName string) Result {
 		}
 		out = append(out, x)
 	}
-	return Result{Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out}
+	return Result{Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts}
 }

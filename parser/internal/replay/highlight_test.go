@@ -70,3 +70,26 @@ func TestTeamKillsIgnored(t *testing.T) {
 		t.Fatalf("team kill produced a highlight: %+v", hs)
 	}
 }
+
+// A knife round is played before the real match and then the game restarts. If those rounds survive,
+// its kills score as an ace and win "Play of the match", and every later round is numbered one high.
+func TestRecorderResetDropsPreRestartRounds(t *testing.T) {
+	r := &Recorder{n: 1, cur: &Round{N: 2}}
+	r.rec.Rounds = []*Round{{N: 1, Kills: make([]Kill, 7)}}
+	r.rec.Density = [][2]float64{{1, 2}, {3, 4}}
+
+	r.reset()
+
+	if len(r.rec.Rounds) != 0 {
+		t.Fatalf("knife round survived: %d rounds", len(r.rec.Rounds))
+	}
+	if r.cur != nil {
+		t.Fatal("round in progress survived the restart")
+	}
+	if r.n != 0 {
+		t.Fatalf("round numbering not rebased: n = %d", r.n)
+	}
+	if len(r.rec.Density) != 2 {
+		t.Fatalf("density should survive (it is only the silhouette): %d samples", len(r.rec.Density))
+	}
+}
