@@ -1,0 +1,1 @@
+{ "name": "@cbbl/worker", "private": true, "type": "module", "scripts": { "parse-job": "node src/parse-job.mjs" } }

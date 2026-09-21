@@ -1,0 +1,12 @@
+node_modules
+
+# Built by the workflow, never committed.
+parser/bin
+worker/cbbl-parse
+worker/cbbl-highlight
+
+# Run artefacts: the demo, the parser's output, the rendered clip.
+# Demos are streamed to the runner and die with it — they are never stored.
+worker/demo.bin
+worker/map.json
+worker/highlight.mp4
