@@ -42,7 +42,7 @@ const map = JSON.parse(await readFile('map.json', 'utf8'));
   const r = map.rounds ?? [];
   const tally = r.reduce((acc, x) => ((acc[x.winner ?? '?'] = (acc[x.winner ?? '?'] ?? 0) + 1), acc), {});
   const brief = (x) => `n=${x.n} ${x.winner ?? '?'} reason=${x.reason} kills=${(x.kills ?? []).length} equip=[${x.equip ?? ''}]`;
-  console.log(`parsed ${map.map}: ${r.length} rounds, winners ${JSON.stringify(tally)}, tickrate ${map.tickrate}`);
+  console.log(`parsed ${map.map}: ${r.length} rounds, winners ${JSON.stringify(tally)}, tickrate ${map.tickrate}, restarts ${map.restarts ?? '?'}`);
   for (const x of r.slice(0, 2)) console.log(`  first  ${brief(x)}`);
   for (const x of r.slice(-2)) console.log(`  last   ${brief(x)}`);
 }
