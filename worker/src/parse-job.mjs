@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 import { postClip } from './discord-clip.mjs';
 
 const run = promisify(execFile);
-const { DOC_ID, DEMO_URL, CBBL_URL, WORKER_SECRET, ALLOWED_HOSTS, DISCORD_MATCHES_WEBHOOK, TRACKED_STEAM_IDS } = process.env;
+const { DOC_ID, DEMO_URL, DEMO_NAME, CBBL_URL, WORKER_SECRET, ALLOWED_HOSTS, DISCORD_MATCHES_WEBHOOK, TRACKED_STEAM_IDS } = process.env;
 if (!DOC_ID || !DEMO_URL || !CBBL_URL || !WORKER_SECRET) throw new Error('missing env');
 
 // Defence in depth: the site already allowlists hosts, but the worker re-checks before fetching anything.
@@ -39,7 +39,8 @@ const map = JSON.parse(await readFile('map.json', 'utf8'));
 const post = await fetch(`${CBBL_URL}/api/ingest/parsed`, {
   method: 'POST',
   headers: { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'application/json' },
-  body: JSON.stringify({ docId: DOC_ID, maps: [map] }),
+  // `demo` names which of the match's demos this was: a Bo3 has one per map.
+  body: JSON.stringify({ docId: DOC_ID, maps: [map], demo: DEMO_NAME || new URL(DEMO_URL).pathname.split('/').pop() }),
 });
 console.log(`cbbl responded ${post.status}`);
 if (!post.ok) process.exit(1);
