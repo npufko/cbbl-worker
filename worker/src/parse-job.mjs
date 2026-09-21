@@ -36,6 +36,17 @@ console.log(`downloaded ${(await stat('demo.bin')).size} bytes`);
 await run('./cbbl-parse', ['--in', 'demo.bin', '--out', 'map.json'], { maxBuffer: 64 << 20 });
 const map = JSON.parse(await readFile('map.json', 'utf8'));
 
+// Round-count mismatches against the FACEIT score are the one cross-check failure that needs the
+// demo to explain it (knife round? a trailing post-match round?). Print enough to tell them apart.
+{
+  const r = map.rounds ?? [];
+  const tally = r.reduce((acc, x) => ((acc[x.winner ?? '?'] = (acc[x.winner ?? '?'] ?? 0) + 1), acc), {});
+  const brief = (x) => `n=${x.n} ${x.winner ?? '?'} reason=${x.reason} kills=${(x.kills ?? []).length} equip=[${x.equip ?? ''}]`;
+  console.log(`parsed ${map.map}: ${r.length} rounds, winners ${JSON.stringify(tally)}, tickrate ${map.tickrate}`);
+  for (const x of r.slice(0, 2)) console.log(`  first  ${brief(x)}`);
+  for (const x of r.slice(-2)) console.log(`  last   ${brief(x)}`);
+}
+
 const post = await fetch(`${CBBL_URL}/api/ingest/parsed`, {
   method: 'POST',
   headers: { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'application/json' },
