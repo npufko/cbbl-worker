@@ -1,0 +1,40 @@
+# Premier / Matchmaking discovery. Scheduled here rather than on Vercel: this needs a logged-in
+# Steam session for the Game Coordinator, STEAM_REFRESH_TOKEN must never reach Vercel, and Vercel
+# Hobby allows one cron a day. Public repo, so standard-runner minutes are free.
+name: valve-discover
+on:
+  schedule:
+    - cron: '*/20 * * * *' # GitHub may delay this under load; it is a sweep, not a deadline
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: valve-discover # one Steam session at a time
+  cancel-in-progress: false
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24', cache-dependency-path: parser/go.sum }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build parser
+        run: |
+          cd parser
+          go build -o ../worker/cbbl-parse ./cmd/cbbl-parse
+      - name: Install worker deps
+        working-directory: worker
+        run: npm install --no-audit --no-fund
+      - name: Walk share codes
+        working-directory: worker
+        env:
+          CBBL_URL: ${{ secrets.CBBL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
+          MATCH_AUTH_CODE: ${{ secrets.MATCH_AUTH_CODE }}
+          STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
+          VALVE_SEED_CODE: ${{ secrets.VALVE_SEED_CODE }}
+        run: node src/valve-discover.mjs
