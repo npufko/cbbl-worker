@@ -22,6 +22,19 @@ for (const [k, v] of Object.entries({ CBBL_URL, WORKER_SECRET, STEAM_API_KEY, MA
 const MAX_PER_RUN = Number(process.env.MAX_MATCHES_PER_RUN ?? 3); // polite to Valve, and keeps a run short
 const auth = { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'application/json' };
 
+// This repo is public, so its Actions logs are world-readable. A share code is not a credential,
+// but it is actionable: it encodes the match id, reservation id and TV port, which is everything
+// needed to ask the Game Coordinator for the match and download the player's demo. Over time the
+// log would also be a public record of who played what and when.
+//
+// `::add-mask::` makes Actions redact the value anywhere it appears afterwards — including inside
+// cbbl's JSON response, which echoes the cursor back. Mask first, then log.
+const hide = (code) => { if (code) console.log(`::add-mask::${code}`); return code; };
+const short = (code) => `${code.slice(0, 9)}…${code.slice(-5)}`; // CSGO-wnDur…KtcZH
+
+hide(VALVE_SEED_CODE);
+hide(process.env.FORCE_SHARE_CODE);
+
 // Valve replays are plain http on replay<N>.valve.net. That exact pattern is allowed and nothing
 // else is: a blanket http allowance would turn this job into an open proxy over cleartext.
 function assertValveReplay(url) {
@@ -76,7 +89,7 @@ console.log(`${players.length} tracked player(s)`);
 // It does not move the cursor backwards: the code is processed, then the cursor is set to it.
 const forced = (process.env.FORCE_SHARE_CODE ?? '').trim();
 if (forced) {
-  console.log(`forced share code: ${forced}`);
+  console.log(`forced share code: ${short(forced)}`);
   players = players.slice(0, 1).map((p) => ({ ...p, forced }));
 }
 
@@ -92,7 +105,8 @@ for (const { steamId, lastCode, forced: forcedCode } of players) {
         ? null
         : await nextShareCode(steamId, cursor).catch((e) => { console.error(`  ${e.message}`); return null; });
     if (!code) break;
-    console.log(`${steamId}: ${code}`);
+    hide(code);
+    console.log(`${steamId}: ${short(code)}`);
     cursor = code;
 
     try {
