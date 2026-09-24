@@ -4,7 +4,12 @@
 name: valve-discover
 on:
   schedule:
-    - cron: '*/20 * * * *' # GitHub may delay this under load; it is a sweep, not a deadline
+    # Best-effort only. GitHub delays scheduled runs under load and drops them outright on busy
+    # hours, and a brand-new cron can take a while to start firing at all — so this is never the
+    # only thing that triggers a walk. cbbl's daily cron sends a repository_dispatch as a backstop.
+    - cron: '*/20 * * * *'
+  repository_dispatch:
+    types: [valve-discover]
   workflow_dispatch:
     inputs:
       share_code:
