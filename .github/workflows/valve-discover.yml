@@ -5,7 +5,12 @@ name: valve-discover
 on:
   schedule:
     - cron: '*/20 * * * *' # GitHub may delay this under load; it is a sweep, not a deadline
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      share_code:
+        description: 'Ingest this share code directly instead of walking the cursor (testing/backfill)'
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -37,4 +42,5 @@ jobs:
           MATCH_AUTH_CODE: ${{ secrets.MATCH_AUTH_CODE }}
           STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
           VALVE_SEED_CODE: ${{ secrets.VALVE_SEED_CODE }}
+          FORCE_SHARE_CODE: ${{ inputs.share_code }}
         run: node src/valve-discover.mjs

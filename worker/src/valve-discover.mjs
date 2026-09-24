@@ -69,16 +69,28 @@ user.logOn({ refreshToken: STEAM_REFRESH_TOKEN });
 await gcReady;
 console.log('GC connected');
 
-const { players } = await (await fetch(`${CBBL_URL}/api/ingest/valve`, { headers: auth })).json();
+let { players } = await (await fetch(`${CBBL_URL}/api/ingest/valve`, { headers: auth })).json();
 console.log(`${players.length} tracked player(s)`);
 
+// One named share code, for testing and for backfilling a match the walk has already passed.
+// It does not move the cursor backwards: the code is processed, then the cursor is set to it.
+const forced = (process.env.FORCE_SHARE_CODE ?? '').trim();
+if (forced) {
+  console.log(`forced share code: ${forced}`);
+  players = players.slice(0, 1).map((p) => ({ ...p, forced }));
+}
+
 let ingested = 0;
-for (const { steamId, lastCode } of players) {
+for (const { steamId, lastCode, forced: forcedCode } of players) {
   let cursor = lastCode ?? VALVE_SEED_CODE;
-  if (!cursor) { console.log(`${steamId}: no cursor and no VALVE_SEED_CODE — skipping`); continue; }
+  if (!cursor && !forcedCode) { console.log(`${steamId}: no cursor and no VALVE_SEED_CODE — skipping`); continue; }
 
   for (let n = 0; n < MAX_PER_RUN; n++) {
-    const code = await nextShareCode(steamId, cursor).catch((e) => { console.error(`  ${e.message}`); return null; });
+    const code = forcedCode && n === 0
+      ? forcedCode
+      : forcedCode
+        ? null
+        : await nextShareCode(steamId, cursor).catch((e) => { console.error(`  ${e.message}`); return null; });
     if (!code) break;
     console.log(`${steamId}: ${code}`);
     cursor = code;

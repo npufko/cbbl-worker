@@ -58,10 +58,26 @@ type Player struct {
 	FlashAssists   int     `json:"flashAssists"`
 	EnemiesFlashed int     `json:"enemiesFlashed"`
 	UtilDmg        int     `json:"utilDmg"`
-	kastRounds     int
+	// Rank, straight off the player entity. CS2 RankType: 7 Wingman, 11 Premier, 12 Competitive.
+	// Rank is a CS Rating (e.g. 23450) under Premier and 1-18 under Competitive — the same field
+	// means two different things, so RankType has to travel with it.
+	RankType   int     `json:"rankType"`
+	Rank       int     `json:"rank"`
+	Wins       int     `json:"wins"`
+	RankNew    int     `json:"rankNew"`    // after the match, from the end-of-match rank update
+	RankChange float32 `json:"rankChange"`
+	kastRounds int
 }
 
+// Mode names what the ranks mean, from the rank type the players were queued under.
+const (
+	ModePremier     = "premier"
+	ModeCompetitive = "competitive"
+	ModeWingman     = "wingman"
+)
+
 type Result struct {
+	Mode     string    `json:"mode"` // premier | competitive | wingman | "" when not a Valve server
 	Map      string    `json:"map"`
 	TickRate float64   `json:"tickrate"`
 	Rounds   []Round   `json:"rounds"`
@@ -94,6 +110,7 @@ func NewCollector(p dem.Parser) *Collector {
 	p.RegisterEventHandler(c.onHurt)
 	p.RegisterEventHandler(c.onFlashed)
 	p.RegisterEventHandler(c.onRoundEnd)
+	p.RegisterEventHandler(c.onRankUpdate)
 	return c
 }
 
@@ -278,9 +295,20 @@ func (c *Collector) onRoundEnd(e events.RoundEnd) {
 			x.kastRounds++
 		}
 	}
-	// Ensure every participant exists even with zero events.
+	// Ensure every participant exists even with zero events, and refresh rank while the entity is
+	// still around — a player who disconnects before the end takes their entity with them.
 	for _, pl := range c.p.GameState().Participants().Playing() {
-		c.player(pl)
+		if x := c.player(pl); x != nil {
+			if t := pl.RankType(); t > 0 {
+				x.RankType = t
+			}
+			if r := pl.Rank(); r > 0 {
+				x.Rank = r
+			}
+			if w := pl.CompetitiveWins(); w > 0 {
+				x.Wins = w
+			}
+		}
 	}
 	// Both sides can be in a clutch (e.g. a 1v1): every attempt counts; the round shows the winner's.
 	for team, cl := range c.clutch {
@@ -297,6 +325,21 @@ func (c *Collector) onRoundEnd(e events.RoundEnd) {
 	}
 	c.rounds = append(c.rounds, *c.cur)
 	c.cur = nil
+}
+
+// Fires at the end of a Valve matchmaking match, once per player whose rank moved.
+func (c *Collector) onRankUpdate(e events.RankUpdate) {
+	x := c.playerByID(strconv.FormatUint(e.SteamID64(), 10))
+	if x == nil {
+		return
+	}
+	x.RankNew, x.RankChange = e.RankNew, e.RankChange
+	if e.RankOld > 0 && x.Rank == 0 {
+		x.Rank = e.RankOld
+	}
+	if e.WinCount > 0 {
+		x.Wins = e.WinCount
+	}
 }
 
 func (c *Collector) playerByID(id string) *Player {
@@ -321,5 +364,32 @@ func (c *Collector) Result(mapName string) Result {
 		}
 		out = append(out, x)
 	}
-	return Result{Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts}
+	return Result{Mode: c.mode(), Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts}
+}
+
+// mode reads the rank type the players were queued under. Empty when the demo did not come from a
+// Valve server (FACEIT, ESEA and LAN demos carry no rank type at all).
+func (c *Collector) mode() string {
+	counts := map[int]int{}
+	for _, x := range c.players {
+		if x.RankType > 0 {
+			counts[x.RankType]++
+		}
+	}
+	best, bestN := 0, 0
+	for t, n := range counts {
+		if n > bestN {
+			best, bestN = t, n
+		}
+	}
+	switch best {
+	case 11:
+		return ModePremier
+	case 12:
+		return ModeCompetitive
+	case 7:
+		return ModeWingman
+	default:
+		return ""
+	}
 }
