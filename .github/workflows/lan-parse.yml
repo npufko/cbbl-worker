@@ -1,0 +1,30 @@
+# LAN flow: parse a batch of an event's demos from its public Drive folder. Dispatched only by cbbl's
+# LAN sync (repository_dispatch); no pull_request triggers, so forks can never run with these secrets.
+# Public repo → unlimited standard-runner minutes; batches of 10 demos keep a run under ~40 min.
+name: lan-parse
+on:
+  repository_dispatch:
+    types: [lan-parse]
+permissions:
+  contents: read
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24', cache-dependency-path: parser/go.sum }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build parser
+        run: cd parser && go build -o ../worker/cbbl-parse ./cmd/cbbl-parse
+      - name: Download, parse, report
+        working-directory: worker
+        env:
+          EVENT_ID: ${{ github.event.client_payload.eventId }}
+          FILES: ${{ toJSON(github.event.client_payload.files) }}
+          CBBL_URL: ${{ secrets.CBBL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+        run: node src/lan-parse.mjs

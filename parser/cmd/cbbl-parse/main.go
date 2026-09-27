@@ -2,6 +2,7 @@
 // Runs on GitHub Actions in the public worker repo — never on end-user PCs.
 //
 //	cbbl-parse --in match.dem.zst --out map.json
+//	cbbl-parse --in map_4386.dem --in map_4386_1.dem --out map.json   (one map, two recording segments)
 //
 // Accepts raw .dem, .dem.zst (FACEIT), .dem.bz2 (Valve) and .dem.gz by magic bytes.
 package main
@@ -19,42 +20,60 @@ import (
 	"github.com/cbbl/parser/internal/stats"
 )
 
+// segments collects repeated --in flags: the recording segments of ONE map, in play order.
+type segments []string
+
+func (s *segments) String() string     { return fmt.Sprint(*s) }
+func (s *segments) Set(v string) error { *s = append(*s, v); return nil }
+
 func main() {
-	in := flag.String("in", "", "demo file (.dem, .dem.zst, .dem.bz2, .dem.gz)")
+	var ins segments
+	flag.Var(&ins, "in", "demo file (.dem, .dem.zst, .dem.bz2, .dem.gz); repeat for the recording segments of one map, in order")
 	out := flag.String("out", "-", "output JSON path, - for stdout")
 	flag.Parse()
-	if *in == "" {
+	if len(ins) == 0 {
 		fail("missing --in")
 	}
-
-	r, closeFn, err := demofile.Open(*in)
-	if err != nil {
-		fail("open: %v", err)
-	}
-	defer closeFn()
 
 	cfg := dem.DefaultParserConfig
 	// Tolerate known CS2 demo quirks instead of aborting the whole match.
 	cfg.IgnoreErrBombsiteIndexNotFound = true
-	p := dem.NewParserWithConfig(r, cfg)
-	defer p.Close()
 
-	// v5 does not expose the demo header on the Parser interface; read the map from ServerInfo.
+	var c *stats.Collector
 	mapName := ""
-	p.RegisterNetMessageHandler(func(m *msg.CSVCMsg_ServerInfo) { mapName = m.GetMapName() })
-
-	c := stats.NewCollector(p)
-	if err := p.ParseToEnd(); err != nil {
-		// A truncated tail is common; keep what we have if rounds were parsed.
-		if len(c.Rounds()) == 0 {
-			fail("parse: %v", err)
+	for i, in := range ins {
+		r, closeFn, err := demofile.Open(in)
+		if err != nil {
+			fail("open %s: %v", in, err)
 		}
-		fmt.Fprintf(os.Stderr, "warning: parse ended early: %v\n", err)
+		defer closeFn()
+		p := dem.NewParserWithConfig(r, cfg)
+		defer p.Close() // kept open to the end: the result reads the last segment's final game state
+
+		// v5 does not expose the demo header on the Parser interface; read the map from ServerInfo.
+		p.RegisterNetMessageHandler(func(m *msg.CSVCMsg_ServerInfo) {
+			if n := m.GetMapName(); n != "" {
+				mapName = n
+			}
+		})
+		if i == 0 {
+			c = stats.NewCollector(p)
+		} else {
+			c.Continue(p)
+		}
+		if err := p.ParseToEnd(); err != nil {
+			// A truncated tail is common; keep what we have if rounds were parsed.
+			if len(c.Rounds()) == 0 && i == len(ins)-1 {
+				fail("parse %s: %v", in, err)
+			}
+			fmt.Fprintf(os.Stderr, "warning: %s: parse ended early: %v\n", in, err)
+		}
 	}
 
 	result := c.Result(mapName)
 	w := os.Stdout
 	if *out != "-" {
+		var err error
 		if w, err = os.Create(*out); err != nil {
 			fail("create out: %v", err)
 		}

@@ -1,0 +1,23 @@
+# LAN flow: follow live events. Every ~10 minutes, ask cbbl to sync any LAN event that is live
+# (list its Drive folder, refresh the bracket, dispatch new demos, promote finished series). With no
+# live event cbbl answers at once. Vercel Hobby cron runs only once a day, hence Actions.
+# GitHub runs schedules best-effort (often a few minutes late) and pauses them after 60 days without
+# a commit to this repo; "Sync now" on cbbl's /admin does the same thing on demand.
+name: lan-poll
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sync live LAN events
+        env:
+          CBBL_URL: ${{ secrets.CBBL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          curl -fsS --max-time 90 -X POST -H "Authorization: Bearer $WORKER_SECRET" "$CBBL_URL/api/ingest/lan/sync"
+          echo

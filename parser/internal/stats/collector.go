@@ -2,6 +2,7 @@
 package stats
 
 import (
+	"sort"
 	"strconv"
 
 	dem "github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs"
@@ -12,6 +13,7 @@ import (
 const (
 	tradeWindowSeconds = 5.0
 	minFlashSeconds    = 1.1 // ignore trivial flashes
+	massWorldDeaths    = 5   // this many "World" deaths at one instant void the round (voidRound)
 )
 
 type Kill struct {
@@ -23,6 +25,19 @@ type Kill struct {
 	HS       bool    `json:"hs"`
 	Traded   bool    `json:"traded"`
 	Opening  bool    `json:"opening"`
+	// Event log v1 (see log.go).
+	FlashAssist  bool    `json:"flashAssist,omitempty"` // the assister's flash, not damage
+	Wallbang     bool    `json:"wallbang,omitempty"`
+	ThroughSmoke bool    `json:"smoke,omitempty"`
+	NoScope      bool    `json:"noscope,omitempty"`
+	KillerBlind  bool    `json:"blind,omitempty"`
+	Distance     float64 `json:"dist,omitempty"`
+	KillerPos    *[3]int `json:"kpos,omitempty"`
+	VictimPos    *[3]int `json:"vpos,omitempty"`
+	KillerHP     int     `json:"khp,omitempty"`
+	KillerSide   string  `json:"kside,omitempty"`
+	VictimSide   string  `json:"vside,omitempty"`
+	Around       []At    `json:"around,omitempty"` // everyone else alive at the kill
 }
 
 type Clutch struct {
@@ -34,10 +49,27 @@ type Clutch struct {
 type Round struct {
 	N      int     `json:"n"`
 	Winner string  `json:"winner"` // "CT" | "T"; mapped to series sides by the worker using team rosters
+	CTTeam int     `json:"ctTeam"` // index into Result.Teams of the team on CT this round
 	Reason int     `json:"reason"` // events.RoundEndReason
 	Equip  [2]int  `json:"equip"`  // [CT, T] freeze-time-end equipment value
 	Kills  []Kill  `json:"kills"`
 	Clutch *Clutch `json:"clutch,omitempty"`
+	// Event log v1 (see log.go).
+	Start     float64       `json:"start"`     // demo seconds when the round started (times below are relative to it)
+	FreezeEnd float64       `json:"freezeEnd"` // seconds since start
+	End       float64       `json:"end"`       // seconds since start
+	MVP       string        `json:"mvp,omitempty"`
+	Bomb      *Bomb         `json:"bomb,omitempty"`
+	Players   []RoundPlayer `json:"players"`
+	Damage    []Damage      `json:"damage"`
+	Nades     []Nade        `json:"nades"`
+	Blinds    []Blind       `json:"blinds"`
+	Shots     []Shots       `json:"shots"`
+	Sightings []Sighting    `json:"sightings"`
+}
+
+func newRound(n int, start float64) *Round {
+	return &Round{N: n, Start: r2(start), Kills: []Kill{}, Players: []RoundPlayer{}, Damage: []Damage{}, Nades: []Nade{}, Blinds: []Blind{}, Shots: []Shots{}, Sightings: []Sighting{}}
 }
 
 type Player struct {
@@ -64,7 +96,7 @@ type Player struct {
 	RankType   int     `json:"rankType"`
 	Rank       int     `json:"rank"`
 	Wins       int     `json:"wins"`
-	RankNew    int     `json:"rankNew"`    // after the match, from the end-of-match rank update
+	RankNew    int     `json:"rankNew"` // after the match, from the end-of-match rank update
 	RankChange float32 `json:"rankChange"`
 	kastRounds int
 }
@@ -77,32 +109,184 @@ const (
 )
 
 type Result struct {
-	Mode     string    `json:"mode"` // premier | competitive | wingman | "" when not a Valve server
-	Map      string    `json:"map"`
-	TickRate float64   `json:"tickrate"`
-	Rounds   []Round   `json:"rounds"`
-	Players  []*Player `json:"players"`
+	LogVersion int       `json:"logVersion"` // event log version (log.go); 0 = before the log existed
+	Mode       string    `json:"mode"`       // premier | competitive | wingman | "" when not a Valve server
+	Map        string    `json:"map"`
+	TickRate   float64   `json:"tickrate"`
+	Rounds     []Round   `json:"rounds"`
+	Players    []*Player `json:"players"`
 	// How many times the game restarted (knife round, LO3). Everything before the last one is
 	// discarded; reported so a round-count dispute can be diagnosed from the worker log alone.
 	Restarts int `json:"restarts"`
+	// How many times a round backup was restored mid-match (a LAN "match medic" after a lag-out).
+	// Play rewinds to an earlier round, so the rounds after it are dropped and replayed.
+	Restores int `json:"restores"`
+	// The two teams as the demo itself saw them. FACEIT and Valve matches get rosters from their own
+	// APIs; a LAN demo has nothing else, so this is where its teams and map winner come from.
+	Teams []Team `json:"teams"`
+}
+
+// Team is one side of the map, followed across the half-time swap by who is on it.
+type Team struct {
+	Name    string   `json:"name"`    // in-game team name (mp_teamname_*), "" if the server set none
+	Players []string `json:"players"` // SteamID64s of everyone who played a live round for it
+	Score   int      `json:"score"`   // rounds won, counted from Rounds
+	// The game's own final score, read off the team entity at the end. Should equal Score; a
+	// difference means rounds were lost or double-counted and the map needs a look.
+	GameScore int `json:"gameScore"`
 }
 
 type Collector struct {
-	p          dem.Parser
-	restarts   int
-	rounds     []Round
-	players    map[uint64]*Player
-	cur        *Round
-	roundStart float64
+	p        dem.Parser
+	restarts int
+	restores int
+	rounds   []Round
+	players  map[uint64]*Player
+	// Player totals as they stood after each completed round (snapshots[i] = after round i+1), so a
+	// round-backup restore can rewind them. A map is ~30 rounds of ~10 players: small.
+	snapshots [][]Player
+	// A MatchStart was seen and not yet judged. It is judged at the next live RoundStart, once the
+	// game's own round count has settled; see settleRestart.
+	pendingRestart bool
+	// The first round of a continued recording segment is still to end: see settleSegment.
+	segmentStart bool
+	// Between a round's end and the next round's start: kills and damage in that window (exit frags,
+	// a molotov still burning) belong to the round that just ended, as FACEIT and HLTV count them.
+	// cur then points at that stored round.
+	postRound bool
+	// Deaths to "World" at one instant (see voidRound): when, how many, and the instant last voided.
+	worldAt, voidAt float64
+	worldN          int
+	teams           []*teamAcc
+	cur             *Round
+	roundStart      float64
 	// per-round state
 	contributed map[uint64]bool // KAST: kill, assist or traded this round
 	died        map[uint64]float64
 	killerOf    map[uint64]uint64
 	clutch      map[common.Team]*Clutch
+	// event log working state (log.go)
+	log     logState
+	lastPos map[uint64]posSample
+	speed   map[uint64]float64
 }
 
 func NewCollector(p dem.Parser) *Collector {
-	c := &Collector{p: p, players: map[uint64]*Player{}}
+	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}}
+	c.attach(p)
+	return c
+}
+
+// Continue carries on collecting the same map from its next recording segment. A LAN server starts
+// a new demo file mid-map (FRAG: <map>_<series>.dem, then <map>_<series>_1.dem), typically after a
+// round-backup restore, and the game's score carries over. The new file is judged like a MatchStart
+// at its first live round: the game's round count equal to ours is a plain continuation; lower means
+// the restore replayed rounds (rewind to it, which also drops the phantom round the restore itself
+// ends); 0 is a genuine restart.
+func (c *Collector) Continue(p dem.Parser) {
+	c.endPostRound()
+	c.attach(p)
+	c.cur = nil
+	c.pendingRestart = true
+	c.segmentStart = true
+}
+
+// settleSegment judges the first round of a continued segment when it ends, against the round count
+// the game reports then (FRAG Midwest): N+1 is the next round; N or lower means a restore sent play
+// back and this round replays round N (12-3 became 11-4), so it replaces it and what came after.
+func (c *Collector) settleSegment() {
+	c.segmentStart = false
+	after := c.p.GameState().TotalRoundsPlayed()
+	if after < 1 || after > len(c.rounds) {
+		return
+	}
+	// Keep only what this round added (voidRound already dropped anything before a restore), on top
+	// of the totals as they stood before the round it replays.
+	delta := c.roundDelta()
+	cur := c.cur
+	c.rewind(after - 1)
+	c.addDelta(delta)
+	cur.N = after
+	c.cur = cur
+}
+
+// voidRound: most of the server died to "World" at one instant. That is a new recording starting
+// (t=0) or a round backup being loaded, never play, so the round in progress starts over from here:
+// its kills, deaths and damage so far are undone.
+func (c *Collector) voidRound(t float64) {
+	c.voidAt = t
+	c.players = map[uint64]*Player{}
+	if n := len(c.snapshots); n > 0 {
+		for i := range c.snapshots[n-1] {
+			x := c.snapshots[n-1][i]
+			if id, err := strconv.ParseUint(x.SteamID, 10, 64); err == nil {
+				c.players[id] = &x
+			}
+		}
+	}
+	c.cur.Kills = []Kill{}
+	c.cur.Clutch = nil
+	c.cur.Damage, c.cur.Nades, c.cur.Blinds, c.cur.Shots, c.cur.Sightings, c.cur.Bomb = []Damage{}, []Nade{}, []Blind{}, []Shots{}, []Sighting{}, nil
+	for i := range c.cur.Players {
+		c.cur.Players[i].HP, c.cur.Players[i].UtilLeft = 0, 0
+	}
+	c.log = newLogState()
+	c.roundStart = t
+	c.contributed = map[uint64]bool{}
+	c.died = map[uint64]float64{}
+	c.killerOf = map[uint64]uint64{}
+	c.clutch = map[common.Team]*Clutch{}
+}
+
+// roundDelta is what the round in progress has added to each player's totals so far.
+func (c *Collector) roundDelta() map[uint64]Player {
+	before := map[string]Player{}
+	if n := len(c.snapshots); n > 0 {
+		for _, x := range c.snapshots[n-1] {
+			before[x.SteamID] = x
+		}
+	}
+	out := map[uint64]Player{}
+	for id, x := range c.players {
+		b := before[x.SteamID]
+		out[id] = Player{
+			SteamID: x.SteamID, Name: x.Name, RankType: x.RankType, Rank: x.Rank, Wins: x.Wins,
+			K: x.K - b.K, D: x.D - b.D, A: x.A - b.A, HS: x.HS - b.HS, Damage: x.Damage - b.Damage,
+			OpeningK: x.OpeningK - b.OpeningK, OpeningD: x.OpeningD - b.OpeningD,
+			ClutchesWon: x.ClutchesWon - b.ClutchesWon, ClutchesAtt: x.ClutchesAtt - b.ClutchesAtt,
+			FlashAssists: x.FlashAssists - b.FlashAssists, EnemiesFlashed: x.EnemiesFlashed - b.EnemiesFlashed,
+			UtilDmg: x.UtilDmg - b.UtilDmg, kastRounds: x.kastRounds - b.kastRounds,
+		}
+	}
+	return out
+}
+
+func (c *Collector) addDelta(delta map[uint64]Player) {
+	for id, d := range delta {
+		x, ok := c.players[id]
+		if !ok {
+			x = &Player{SteamID: d.SteamID}
+			c.players[id] = x
+		}
+		x.Name, x.RankType, x.Rank, x.Wins = d.Name, d.RankType, d.Rank, d.Wins
+		x.K += d.K
+		x.D += d.D
+		x.A += d.A
+		x.HS += d.HS
+		x.Damage += d.Damage
+		x.OpeningK += d.OpeningK
+		x.OpeningD += d.OpeningD
+		x.ClutchesWon += d.ClutchesWon
+		x.ClutchesAtt += d.ClutchesAtt
+		x.FlashAssists += d.FlashAssists
+		x.EnemiesFlashed += d.EnemiesFlashed
+		x.UtilDmg += d.UtilDmg
+		x.kastRounds += d.kastRounds
+	}
+}
+
+func (c *Collector) attach(p dem.Parser) {
+	c.p = p
 	p.RegisterEventHandler(c.onMatchStart)
 	p.RegisterEventHandler(c.onRoundStart)
 	p.RegisterEventHandler(c.onFreezeEnd)
@@ -111,19 +295,90 @@ func NewCollector(p dem.Parser) *Collector {
 	p.RegisterEventHandler(c.onFlashed)
 	p.RegisterEventHandler(c.onRoundEnd)
 	p.RegisterEventHandler(c.onRankUpdate)
-	return c
+	p.RegisterEventHandler(c.onFrame)
+	p.RegisterEventHandler(c.onFire)
+	p.RegisterEventHandler(c.onThrow)
+	p.RegisterEventHandler(c.onNadeEvent)
+	p.RegisterEventHandler(c.onNadeDestroy)
+	p.RegisterEventHandler(c.onPlanted)
+	p.RegisterEventHandler(c.onDefused)
+	p.RegisterEventHandler(c.onExploded)
+	p.RegisterEventHandler(c.onMVP)
+	c.lastPos = map[uint64]posSample{} // positions do not carry across recording segments
 }
 
-// FACEIT and ESEA play a knife round for side choice and then restart the game, and servers LO3
-// before going live. Each restart fires MatchStart again, so everything collected before the LAST
-// one has to go: a counted knife round makes the round total disagree with the official score, and
-// its kills silently inflate every player's K/D, ADR and Rating 2.0.
-func (c *Collector) onMatchStart(events.MatchStart) { c.reset() }
+// MatchStart fires for two different things, and they need opposite handling:
+//
+//   - a real restart: FACEIT and ESEA play a knife round for side choice and then restart, and
+//     servers LO3 before going live. Everything collected before it has to go — a counted knife
+//     round makes the round total disagree with the official score and inflates every player's
+//     K/D, ADR and Rating 2.0.
+//   - a round-backup restore: LAN admins ("match medics") reload a backup after a lag-out, and play
+//     resumes at 7-5 or wherever it was. Resetting there would silently drop every round before
+//     it and still parse "successfully" with half the match.
+//
+// The game's own score tells them apart, but it has not necessarily settled at the MatchStart tick,
+// so the round in progress is dropped now (it will be replayed either way) and the decision waits
+// for the next live RoundStart.
+func (c *Collector) onMatchStart(events.MatchStart) {
+	c.endPostRound()
+	c.cur = nil
+	c.pendingRestart = true
+}
+
+// settleRestart judges a pending MatchStart against the number of rounds the game says were played.
+func (c *Collector) settleRestart(played int) {
+	if !c.pendingRestart {
+		return
+	}
+	c.pendingRestart = false
+	switch {
+	case played <= 0:
+		c.reset() // knife round / LO3: the game is back at 0-0
+	case played < len(c.rounds):
+		c.rewind(played) // match medic: resume at round played+1
+	default:
+		// Nothing we collected is being replayed (e.g. a MatchStart with no rewind): keep it all.
+	}
+}
+
+// rewind drops every round after the first n and restores player totals to how they stood then.
+func (c *Collector) rewind(n int) {
+	c.postRound = false
+	c.restores++
+	c.rounds = c.rounds[:n]
+	c.snapshots = c.snapshots[:n]
+	c.players = map[uint64]*Player{}
+	c.cur = nil
+	if n == 0 {
+		return
+	}
+	for i := range c.snapshots[n-1] {
+		x := c.snapshots[n-1][i] // a copy: later rounds must not write into the snapshot
+		id, err := strconv.ParseUint(x.SteamID, 10, 64)
+		if err != nil {
+			continue
+		}
+		c.players[id] = &x
+	}
+}
+
+// snapshot records the player totals after the round just completed.
+func (c *Collector) snapshot() {
+	s := make([]Player, 0, len(c.players))
+	for _, x := range c.players {
+		s = append(s, *x)
+	}
+	c.snapshots = append(c.snapshots, s)
+}
 
 // reset drops all accumulated match state, keeping only the parser handle.
 func (c *Collector) reset() {
+	c.postRound = false
 	c.restarts++
 	c.rounds = nil
+	c.teams = nil
+	c.snapshots = nil
 	c.players = map[uint64]*Player{}
 	c.cur = nil
 	c.roundStart = 0
@@ -154,11 +409,14 @@ func (c *Collector) player(pl *common.Player) *Player {
 func (c *Collector) now() float64 { return c.p.CurrentTime().Seconds() }
 
 func (c *Collector) onRoundStart(events.RoundStart) {
+	c.endPostRound()
 	if !c.live() {
 		return
 	}
-	c.cur = &Round{N: len(c.rounds) + 1, Kills: []Kill{}}
+	c.settleRestart(c.p.GameState().TotalRoundsPlayed())
+	c.cur = newRound(len(c.rounds)+1, c.now())
 	c.roundStart = c.now()
+	c.log = newLogState()
 	c.contributed = map[uint64]bool{}
 	c.died = map[uint64]float64{}
 	c.killerOf = map[uint64]uint64{}
@@ -169,6 +427,8 @@ func (c *Collector) onFreezeEnd(events.RoundFreezetimeEnd) {
 	if c.cur == nil {
 		return
 	}
+	c.cur.FreezeEnd = c.roundT()
+	c.logFreezeEnd()
 	for _, pl := range c.p.GameState().Participants().Playing() {
 		switch pl.Team {
 		case common.TeamCounterTerrorists:
@@ -184,9 +444,38 @@ func (c *Collector) onKill(e events.Kill) {
 		return
 	}
 	t := c.now()
+	// "World": no enemy killer (none, or the victim themself) and the world as the weapon.
+	if (e.Killer == nil || e.Killer == e.Victim) && e.Weapon != nil && (e.Weapon.Type == common.EqWorld || e.Weapon.String() == "World") {
+		if t == c.voidAt {
+			return // the rest of a voided instant
+		}
+		if t != c.worldAt {
+			c.worldAt, c.worldN = t, 0
+		}
+		if c.postRound {
+			return // a restore or recording artifact after the round: not part of it
+		}
+		if c.worldN++; c.worldN >= massWorldDeaths {
+			c.voidRound(t)
+			return
+		}
+	}
 	k := Kill{T: t - c.roundStart, Victim: strconv.FormatUint(e.Victim.SteamID64, 10), HS: e.IsHeadshot, Opening: len(c.cur.Kills) == 0}
 	if e.Weapon != nil {
 		k.Weapon = e.Weapon.String()
+	}
+	k.T = r2(k.T)
+	k.FlashAssist, k.Wallbang, k.ThroughSmoke, k.NoScope, k.KillerBlind = e.AssistedFlash, e.IsWallBang(), e.ThroughSmoke, e.NoScope, e.AttackerBlind
+	k.Distance = r1(float64(e.Distance))
+	vp := vec3(e.Victim.Position())
+	k.VictimPos, k.VictimSide = &vp, sideOf(e.Victim.Team)
+	if e.Killer != nil {
+		kp := vec3(e.Killer.Position())
+		k.KillerPos, k.KillerHP, k.KillerSide = &kp, e.Killer.Health(), sideOf(e.Killer.Team)
+	}
+	k.Around = c.around(e.Killer, e.Victim)
+	if rp := c.roundPlayer(e.Victim); rp != nil {
+		rp.HP, rp.UtilLeft = 0, utilHeld(e.Victim)
 	}
 	if v := c.player(e.Victim); v != nil {
 		v.D++
@@ -254,6 +543,7 @@ func (c *Collector) checkClutch() {
 }
 
 func (c *Collector) onHurt(e events.PlayerHurt) {
+	c.logHurt(e)
 	if c.cur == nil || e.Attacker == nil || e.Player == nil || e.Attacker.Team == e.Player.Team {
 		return
 	}
@@ -268,6 +558,7 @@ func (c *Collector) onHurt(e events.PlayerHurt) {
 }
 
 func (c *Collector) onFlashed(e events.PlayerFlashed) {
+	c.logBlind(e)
 	if c.cur == nil || e.Attacker == nil || e.Player == nil || e.Attacker.Team == e.Player.Team {
 		return
 	}
@@ -279,8 +570,11 @@ func (c *Collector) onFlashed(e events.PlayerFlashed) {
 }
 
 func (c *Collector) onRoundEnd(e events.RoundEnd) {
-	if c.cur == nil {
+	if c.cur == nil || c.postRound {
 		return
+	}
+	if c.segmentStart {
+		c.settleSegment()
 	}
 	c.cur.Reason = int(e.Reason)
 	c.cur.Winner = map[common.Team]string{common.TeamCounterTerrorists: "CT", common.TeamTerrorists: "T"}[e.Winner]
@@ -323,8 +617,109 @@ func (c *Collector) onRoundEnd(e events.RoundEnd) {
 			c.cur.Clutch = cl
 		}
 	}
+	c.cur.CTTeam = c.sideTeams()
+	c.cur.End = c.roundT()
+	c.logRoundEnd()
 	c.rounds = append(c.rounds, *c.cur)
+	c.snapshot()
+	c.cur = &c.rounds[len(c.rounds)-1]
+	c.postRound = true
+}
+
+// endPostRound closes the window after a round's end: the snapshot taken at the end is refreshed so
+// it includes what happened after it (a later rewind restores the true totals).
+func (c *Collector) endPostRound() {
+	if !c.postRound {
+		return
+	}
+	c.postRound = false
 	c.cur = nil
+	if n := len(c.snapshots); n > 0 {
+		c.snapshots = c.snapshots[:n-1]
+		c.snapshot()
+	}
+}
+
+// teamAcc accumulates one team across the match.
+type teamAcc struct {
+	name    string
+	players map[string]bool
+}
+
+// sideTeams works out which of the two teams is on CT this round, records who is on each and the
+// in-game names, and returns the CT team's index. Teams are told apart by who is on them, not by
+// side (sides swap at half time) and not by name (a server may set none).
+func (c *Collector) sideTeams() int {
+	gs := c.p.GameState()
+	ids := func(ts *common.TeamState) []string {
+		out := []string{}
+		for _, pl := range ts.Members() {
+			if pl != nil && pl.SteamID64 != 0 {
+				out = append(out, strconv.FormatUint(pl.SteamID64, 10))
+			}
+		}
+		return out
+	}
+	ct, t := gs.TeamCounterTerrorists(), gs.TeamTerrorists()
+	ctIdx := c.assignTeams(ids(ct), ids(t))
+	if n := ct.ClanName(); n != "" {
+		c.teams[ctIdx].name = n
+	}
+	if n := t.ClanName(); n != "" {
+		c.teams[1-ctIdx].name = n
+	}
+	return ctIdx
+}
+
+// assignTeams returns the index of the team the CT players belong to (the T players are the other
+// one) and adds both rosters to their team. The first round founds the two teams.
+func (c *Collector) assignTeams(ctIDs, tIDs []string) int {
+	if len(c.teams) < 2 {
+		c.teams = []*teamAcc{{players: map[string]bool{}}, {players: map[string]bool{}}}
+	}
+	overlap := func(team *teamAcc, ids []string) int {
+		n := 0
+		for _, id := range ids {
+			if team.players[id] {
+				n++
+			}
+		}
+		return n
+	}
+	// CT is whichever team shares more players with this CT side, or with the other team's T side.
+	score0 := overlap(c.teams[0], ctIDs) + overlap(c.teams[1], tIDs)
+	score1 := overlap(c.teams[1], ctIDs) + overlap(c.teams[0], tIDs)
+	ctIdx := 0
+	if score1 > score0 {
+		ctIdx = 1
+	}
+	for _, id := range ctIDs {
+		c.teams[ctIdx].players[id] = true
+	}
+	for _, id := range tIDs {
+		c.teams[1-ctIdx].players[id] = true
+	}
+	return ctIdx
+}
+
+// teamResults turns the accumulated teams into output, with scores counted from the kept rounds.
+func (c *Collector) teamResults(gameScore func(i int) int) []Team {
+	out := make([]Team, 0, len(c.teams))
+	for i, acc := range c.teams {
+		players := make([]string, 0, len(acc.players))
+		for id := range acc.players {
+			players = append(players, id)
+		}
+		sort.Strings(players)
+		won := 0
+		for _, r := range c.rounds {
+			if (r.Winner == "CT") == (r.CTTeam == i) && r.Winner != "" {
+				won++
+			}
+		}
+		out = append(out, Team{Name: acc.name, Players: players, Score: won, GameScore: gameScore(i)})
+	}
+	return out
 }
 
 // Fires at the end of a Valve matchmaking match, once per player whose rank moved.
@@ -354,6 +749,9 @@ func (c *Collector) playerByID(id string) *Player {
 func (c *Collector) Rounds() []Round { return c.rounds }
 
 func (c *Collector) Result(mapName string) Result {
+	c.endPostRound()
+	// A restart with no round after it (the demo ends first): judge it on the final score.
+	c.settleRestart(c.p.GameState().TotalRoundsPlayed())
 	n := len(c.rounds)
 	out := make([]*Player, 0, len(c.players))
 	for _, x := range c.players {
@@ -364,7 +762,19 @@ func (c *Collector) Result(mapName string) Result {
 		}
 		out = append(out, x)
 	}
-	return Result{Mode: c.mode(), Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts}
+	// The game's final score for each team: read off whichever side holds that team at the end.
+	gs := c.p.GameState()
+	gameScore := func(i int) int {
+		if len(c.rounds) == 0 {
+			return 0
+		}
+		last := c.rounds[len(c.rounds)-1]
+		if last.CTTeam == i {
+			return gs.TeamCounterTerrorists().Score()
+		}
+		return gs.TeamTerrorists().Score()
+	}
+	return Result{LogVersion: LogVersion, Mode: c.mode(), Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts, Restores: c.restores, Teams: c.teamResults(gameScore)}
 }
 
 // mode reads the rank type the players were queued under. Empty when the demo did not come from a

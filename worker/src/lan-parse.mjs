@@ -1,0 +1,99 @@
+// Runs on GitHub Actions (public worker repo), dispatched by cbbl's LAN sync with a batch of Drive
+// files grouped by map: download a map's public demo files from Drive, parse them together, POST the
+// result to /api/ingest/lan. One map's files on disk at a time, deleted before the next. Demos are never stored.
+import { execFile } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
+import { readFile, rm, stat } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+const { EVENT_ID, FILES, CBBL_URL, WORKER_SECRET, GOOGLE_DRIVE_API_KEY } = process.env;
+if (!EVENT_ID || !FILES || !CBBL_URL || !WORKER_SECRET || !GOOGLE_DRIVE_API_KEY) throw new Error('missing env');
+
+// The dispatch payload only ever names Drive file ids; the URL is built here, so this job can never
+// be pointed at another host.
+const files = JSON.parse(FILES).filter((f) => /^[A-Za-z0-9_-]{10,100}$/.test(f?.fileId ?? ''));
+
+async function report(fileId, body) {
+  const res = await fetch(`${CBBL_URL}/api/ingest/lan`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ eventId: EVENT_ID, fileId, ...body }),
+  });
+  const text = await res.text();
+  console.log(`  cbbl ${res.status} ${text.slice(0, 240)}`);
+  return res.ok;
+}
+
+/**
+ * Drive turning downloads away for a while (its "automated queries" page, a rate or download-quota
+ * error, 429 or 5xx) is not the demo's fault: cbbl queues it again. Anything else (a file no longer
+ * shared, say) is a real failure.
+ */
+async function driveRefusal(res) {
+  if (res.status === 429 || res.status >= 500) return true;
+  if (res.status !== 403) return false;
+  const text = (await res.text().catch(() => '')).slice(0, 4000);
+  return /automated queries|rateLimitExceeded|userRateLimitExceeded|downloadQuotaExceeded|quotaExceeded/i.test(text);
+}
+
+// One map per group: its recording segments (FRAG: <map>_<id>.dem, then _1 …), in the order sent,
+// parsed together in one cbbl-parse run and reported once, on the last file. Up to a few segments
+// of ~300 MB each are on disk at once, deleted before the next map.
+const groups = [];
+for (const f of files) {
+  const key = f.group ?? f.fileId;
+  const last = groups.at(-1);
+  if (last && last.key === key) last.files.push(f);
+  else groups.push({ key, files: [f] });
+}
+
+let failures = 0;
+let reported = 0;
+for (const [gi, g] of groups.entries()) {
+  const target = g.files.at(-1);
+  const merged = g.files.slice(0, -1).map((f) => f.fileId);
+  const paths = g.files.map((_, i) => `lan-${i}.dem`);
+  console.log(g.files.map((f) => f.name ?? f.fileId).join(' + '));
+  try {
+    let refused = null;
+    for (const [i, { fileId }] of g.files.entries()) {
+      const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${encodeURIComponent(GOOGLE_DRIVE_API_KEY)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(15 * 60_000) });
+      if (!res.ok && (await driveRefusal(res))) { refused = res.status; break; }
+      if (!res.ok || !res.body) throw new Error(`Drive download ${res.status}`);
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(paths[i]));
+      console.log(`  downloaded ${(await stat(paths[i])).size} bytes`);
+    }
+    if (refused !== null) {
+      // Stop here rather than hammer Drive: this map and the rest of the batch go back in the queue.
+      const why = `Drive refused the download (${refused}); queued again`;
+      const rest = groups.slice(gi);
+      console.error(`  ${why}: handing back ${rest.length} map(s)`);
+      for (const r of rest) {
+        await report(r.files.at(-1).fileId, { error: why, retry: true, merged: r.files.slice(0, -1).map((f) => f.fileId) }).catch(() => {});
+      }
+      break;
+    }
+
+    await run('./cbbl-parse', [...paths.flatMap((x) => ['--in', x]), '--out', 'lan.json'], { maxBuffer: 64 << 20 });
+    const map = JSON.parse(await readFile('lan.json', 'utf8'));
+    const teams = (map.teams ?? []).map((t) => `${t.name || '?'} ${t.score}`).join(' vs ');
+    console.log(`  parsed ${map.map}: ${teams}, ${map.rounds?.length} rounds, restarts ${map.restarts}, restores ${map.restores}, log v${map.logVersion}`);
+    if (await report(target.fileId, { map, merged })) reported++;
+    else failures++;
+  } catch (e) {
+    failures++;
+    // Never echo the URL: it carries the API key.
+    const why = String(e?.message ?? e).replace(/key=[^&\s]+/g, 'key=…').slice(0, 300);
+    console.error(`  failed: ${why}`);
+    await report(target.fileId, { error: why, merged }).catch(() => {});
+  } finally {
+    for (const x of paths) await rm(x, { force: true });
+    await rm('lan.json', { force: true });
+  }
+}
+console.log(`done: ${reported}/${groups.length} maps reported`);
+if (failures) process.exit(1);
