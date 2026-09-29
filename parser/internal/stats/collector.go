@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	dem "github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs"
+	"github.com/golang/geo/r3"
 	"github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs/common"
 	"github.com/markus-wa/demoinfocs-golang/v5/pkg/demoinfocs/events"
 )
@@ -182,11 +183,13 @@ type Collector struct {
 	// (see inferHits).
 	hpSeen    map[uint64]int
 	hurtFrame map[uint64]hurtSum
+	heFrame   []heBlast
+	killFrame map[uint64]frameKill
 	check     checkState
 }
 
 func NewCollector(p dem.Parser) *Collector {
-	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}, check: newCheckState(), hurtHP: map[uint64]tickHP{}, hpSeen: map[uint64]int{}, hurtFrame: map[uint64]hurtSum{}}
+	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}, check: newCheckState(), hurtHP: map[uint64]tickHP{}, hpSeen: map[uint64]int{}, hurtFrame: map[uint64]hurtSum{}, killFrame: map[uint64]frameKill{}}
 	c.attach(p)
 	return c
 }
@@ -437,11 +440,30 @@ func (c *Collector) onRoundStart(events.RoundStart) {
 	if !c.live() {
 		return
 	}
-	c.settleRestart(c.p.GameState().TotalRoundsPlayed())
+	played := c.p.GameState().TotalRoundsPlayed()
+	c.settleRestart(played)
+	c.followRestore(played)
 	if len(c.rounds) > 0 && !c.segmentStart {
 		c.commitRounds()
 		c.selfCheck(c.playing())
 	}
+	c.startRound()
+}
+
+// followRestore: the game's own count of rounds played fell below ours with no MatchStart, so a round
+// backup was loaded and play resumes at round played+1 (FRAG Midwest 3627, 3825, 3994, 4057: a match
+// medic mid-round, no restart event, no mass slay; the rounds after it were counted twice). The
+// rounds after it are dropped and the totals rewound, as for a restore judged at a MatchStart.
+func (c *Collector) followRestore(played int) bool {
+	if c.pendingRestart || c.segmentStart || played < 0 || played >= len(c.rounds) {
+		return false
+	}
+	c.rewind(played)
+	return true
+}
+
+// startRound opens a new round in progress, numbered after the rounds kept.
+func (c *Collector) startRound() {
 	c.cur = newRound(len(c.rounds)+1, c.now())
 	c.roundStart = c.now()
 	c.log = newLogState()
@@ -457,6 +479,17 @@ func (c *Collector) onFreezeEnd(events.RoundFreezetimeEnd) {
 	}
 	c.cur.FreezeEnd = c.roundT()
 	c.logFreezeEnd()
+	// A recording that starts with the match opens before the players are in (FRAG Midwest 3892, 3962:
+	// round 1's MVP read as a first sighting, not a rise). Everyone is in by now and the round has no
+	// MVP yet: a missing baseline is taken here (creditMVP).
+	if c.mvps == nil {
+		c.mvps = map[uint64]int{}
+	}
+	for _, pl := range c.playing() {
+		if _, seen := c.mvps[pl.SteamID64]; !seen {
+			c.mvps[pl.SteamID64] = pl.MVPs()
+		}
+	}
 	for _, pl := range c.playing() {
 		switch pl.Team {
 		case common.TeamCounterTerrorists:
@@ -538,6 +571,7 @@ func (c *Collector) leaveOutSlain(e events.Kill) {
 
 // recordKill logs a kill (or a death with no enemy killer) and credits it.
 func (c *Collector) recordKill(e events.Kill, t float64) {
+	c.killFrame[e.Victim.SteamID64] = frameKill{by: e.Killer, weapon: e.Weapon}
 	k := Kill{T: t - c.roundStart, Victim: strconv.FormatUint(e.Victim.SteamID64, 10), HS: e.IsHeadshot, Opening: len(c.cur.Kills) == 0}
 	if e.Weapon != nil {
 		k.Weapon = e.Weapon.String()
@@ -655,21 +689,41 @@ type tickHP struct{ tick, health int }
 // hurtSum is what one frame's hurt events took from a player, and how many hits.
 type hurtSum struct{ hp, hits int }
 
-// fireReach: a victim this close (2D) to a burning flame may be taking that fire's damage. 95% of
-// logged fire hits land within 77 units of the thrower's nearest flame (1,624 hits, 13 demos).
-const fireReach = 100.0
+// heBlast is an HE grenade exploding this frame: who threw it and where.
+type heBlast struct {
+	by  *common.Player
+	pos r3.Vector
+}
+
+// frameKill is a kill this frame: who, with what (see inferHit).
+type frameKill struct {
+	by     *common.Player
+	weapon *common.Equipment
+}
+
+const (
+	// fireReach: a victim this close (2D) to a burning flame may be taking that fire's damage. 95% of
+	// logged fire hits land within 77 units of the thrower's nearest flame (1,624 hits, 13 demos).
+	fireReach = 100.0
+	// heReach: an HE exploding this close (3D) may have dealt a missing hit (its damage radius ~350).
+	heReach = 400.0
+)
 
 // onHealthFrame: a demo can lack hurt events the game counted. FRAG Jersey 2579 r19: Galaxy's
 // molotov took 2+3+3 HP from skylar with no player_hurt in the file at all, yet the game credited
-// Galaxy the 8 (damage and utility damage). So each frame, a live player's health drop beyond what
-// that frame's hurt events explain (each hit may be 1 HP over its dmg_health, see hpTaken) is a missing
-// hit. Only a fire can be named as its source: when exactly one thrower's fire is burning within reach
-// of the victim, the hit is logged as that fire's, marked inferred. Anything else is left out, and the
+// Galaxy the 8 (damage and utility damage). So each frame, a player's health drop beyond what that
+// frame's hurt events explain (each hit may be 1 HP over its dmg_health, see hpTaken) is a missing hit,
+// logged as inferred when its source is certain (inferHit). Anything else is left out, and the
 // self-check against the game's counters reports it. 26 FACEIT, Valve and pro demos: no such drop.
 func (c *Collector) onHealthFrame(events.FrameDone) {
 	c.flushWorld()
-	hurt := c.hurtFrame
-	c.hurtFrame = map[uint64]hurtSum{}
+	// A backup loaded mid-round fires no round event at all: the game's round count is the only sign.
+	// Not after a round's end, where ours already counts the round the game is still closing.
+	if c.cur != nil && !c.postRound && c.live() && c.followRestore(c.p.GameState().TotalRoundsPlayed()) {
+		c.startRound()
+	}
+	hurt, blasts, kills := c.hurtFrame, c.heFrame, c.killFrame
+	c.hurtFrame, c.heFrame, c.killFrame = map[uint64]hurtSum{}, nil, map[uint64]frameKill{}
 	infer := c.cur != nil && c.live() && c.now() != c.voidAt
 	for _, pl := range c.playing() {
 		if pl.SteamID64 == 0 {
@@ -678,46 +732,65 @@ func (c *Collector) onHealthFrame(events.FrameDone) {
 		h := pl.Health()
 		prev, seen := c.hpSeen[pl.SteamID64]
 		c.hpSeen[pl.SteamID64] = h
-		if !infer || !seen || !pl.IsAlive() || h >= prev {
-			continue // dead this frame: a death with no hurt event is not a fire's to claim
+		if !infer || !seen || h >= prev {
+			continue
 		}
 		got := hurt[pl.SteamID64]
 		if gap := prev - h - got.hp; gap > got.hits {
-			c.inferFireHit(pl, gap)
+			k, killed := kills[pl.SteamID64]
+			c.inferHit(pl, gap, blasts, k, killed)
 		}
 	}
 }
 
-// inferFireHit logs a missing hit of hp on victim, if exactly one thrower's fire can have dealt it.
-func (c *Collector) inferFireHit(victim *common.Player, hp int) {
-	pos := victim.Position()
+// inferHit logs a missing hit of hp on victim when its source is certain:
+//   - a killing hit (the victim died this frame): the kill names the killer and weapon (FRAG Midwest
+//     3960, 4386: the final hit's player_hurt missing, 3 and 73 HP);
+//   - otherwise exactly one thrower whose fire burns within fireReach, or whose HE exploded within
+//     heReach this frame (FRAG Midwest 3994: an HE's 1 HP).
+func (c *Collector) inferHit(victim *common.Player, hp int, blasts []heBlast, k frameKill, killed bool) {
 	var by *common.Player
-	for _, inf := range c.p.GameState().Infernos() {
-		th := inf.Thrower()
-		if th == nil {
-			continue
+	var w string
+	switch {
+	case killed:
+		if k.by == nil || k.by.SteamID64 == victim.SteamID64 || k.weapon == nil {
+			return // a death to the world or to oneself: nobody to credit
 		}
-		near := false
-		for _, f := range inf.Fires().Active().List() {
-			if math.Hypot(f.X-pos.X, f.Y-pos.Y) <= fireReach {
-				near = true
-				break
+		by, w = k.by, k.weapon.String()
+	case victim.IsAlive():
+		pos := victim.Position()
+		one := func(th *common.Player, weapon string) bool {
+			if th == nil {
+				return true
+			}
+			if by != nil && by.SteamID64 != th.SteamID64 {
+				return false // two throwers: whose it was cannot be told
+			}
+			by, w = th, weapon
+			return true
+		}
+		for _, inf := range c.p.GameState().Infernos() {
+			for _, f := range inf.Fires().Active().List() {
+				if math.Hypot(f.X-pos.X, f.Y-pos.Y) <= fireReach {
+					fire := "Incendiary Grenade"
+					if th := inf.Thrower(); th != nil && th.Team == common.TeamTerrorists {
+						fire = "Molotov"
+					}
+					if !one(inf.Thrower(), fire) {
+						return
+					}
+					break
+				}
 			}
 		}
-		if !near {
-			continue
+		for _, b := range blasts {
+			if b.pos.Sub(pos).Norm() <= heReach && !one(b.by, "HE Grenade") {
+				return
+			}
 		}
-		if by != nil && by.SteamID64 != th.SteamID64 {
-			return // two throwers' fires: whose it was cannot be told
-		}
-		by = th
 	}
 	if by == nil {
 		return
-	}
-	w := "Incendiary Grenade"
-	if by.Team == common.TeamTerrorists {
-		w = "Molotov"
 	}
 	c.cur.Damage = append(c.cur.Damage, Damage{T: c.roundT(), Attacker: sid(by), Victim: sid(victim), HP: hp, Weapon: w, Inferred: true})
 	if by.Team == victim.Team {
@@ -725,7 +798,9 @@ func (c *Collector) inferFireHit(victim *common.Player, hp int) {
 	}
 	if a := c.player(by); a != nil {
 		a.Damage += hp
-		a.UtilDmg += hp
+		if w == "HE Grenade" || w == "Molotov" || w == "Incendiary Grenade" {
+			a.UtilDmg += hp
+		}
 	}
 }
 

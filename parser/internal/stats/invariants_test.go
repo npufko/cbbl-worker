@@ -37,6 +37,12 @@ func TestInvariantsCatchWhatTheCountersShare(t *testing.T) {
 	if b := checkInvariants([]Round{takeover}, nil); len(b) != 0 {
 		t.Errorf("a bot takeover's second life broke %+v", b)
 	}
+	// Out twice in freeze time and back each time, then killed in play (FRAG Midwest 3627 r5).
+	rejoined := ok
+	rejoined.Kills = append([]Kill{{Victim: "a", Weapon: "World"}, {Victim: "a", Weapon: "World"}}, ok.Kills...)
+	if b := checkInvariants([]Round{rejoined}, nil); len(b) != 0 {
+		t.Errorf("rejoining after leaving broke %+v", b)
+	}
 	if b := checkInvariants(nil, []Team{{Name: "MOUZ", Score: 12, GameScore: 13}}); len(b) != 1 {
 		t.Errorf("a lost round passed: %+v", b)
 	}

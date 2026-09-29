@@ -49,20 +49,24 @@ func checkInvariants(rounds []Round, teams []Team) []Broken {
 				broke("at most 100 HP taken", "%s took %d", id, taken[id])
 			}
 		}
-		deaths, world := map[string]int{}, map[string]bool{}
+		deaths, played, world := map[string]int{}, map[string]int{}, map[string]bool{}
 		for _, k := range r.Kills {
 			deaths[k.Victim]++
 			if k.Weapon == "World" {
 				world[k.Victim] = true
+			} else {
+				played[k.Victim]++
 			}
 			if side[k.Victim] == "" {
 				broke("the dead played the round", "%s died at %.2f", k.Victim, k.T)
 			}
 		}
-		for _, id := range sortedKeys(deaths) {
-			// A second life is possible only by taking over the bot that replaced you after you left.
-			if c := deaths[id]; c > 2 || (c == 2 && !world[id]) {
-				broke("one death a round", "%s died %d times", id, c)
+		for _, id := range sortedKeys(played) {
+			// Another life comes only after leaving (the game kills a leaver: "World"): taking over the bot
+			// that replaced you, or rejoining during freeze time (FRAG Midwest 3627 r5: out twice with a
+			// crashing PC, 3 deaths, the game counts all 3). So at most one death a round to play.
+			if c := played[id]; c > 1 {
+				broke("one death a round", "%s died %d times in play (%d in all)", id, c, deaths[id])
 			}
 		}
 		for _, p := range r.Players {

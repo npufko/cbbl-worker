@@ -24,7 +24,11 @@ import (
 // not players (no line, no round entry, not alive in a clutch).
 // v5: fire hits missing from the demo, inferred from health (Damage.Inferred); a player dying alone
 // to "World" after the round (a fall) is a death, as the game counts it.
-const LogVersion = 5
+// v6: a round backup loaded with no MatchStart (the game's round count falls) rewinds like a restore;
+// round 1's MVP counted when the recording starts before the players are in; a missing killing hit
+// inferred from the kill, a missing HE hit from its explosion; an HE's hits on the tick it explodes are
+// never impacts. (FRAG Midwest: 8 of 132 maps failed the self-check on v5; all pass on v6.)
+const LogVersion = 6
 
 // v2: kills, damage, blinds and grenades between a round's end and the next round's start count for
 // the round that just ended (v1 dropped them: FACEIT and HLTV count exit frags).
@@ -176,10 +180,11 @@ type logState struct {
 	nadeIdx map[int]int
 	shotIdx map[string]int
 	seeing  map[uint64]int // enemies in view, per player, as of the last frame
+	boom    map[int]int    // HE grenade entity id -> the tick it exploded (see isImpact)
 }
 
 func newLogState() logState {
-	return logState{sight: map[[2]uint64]*sighting{}, bursts: map[uint64]*burst{}, nadeIdx: map[int]int{}, shotIdx: map[string]int{}, seeing: map[uint64]int{}}
+	return logState{sight: map[[2]uint64]*sighting{}, bursts: map[uint64]*burst{}, nadeIdx: map[int]int{}, shotIdx: map[string]int{}, seeing: map[uint64]int{}, boom: map[int]int{}}
 }
 
 func r2(v float64) float64 { return math.Round(v*100) / 100 }
@@ -469,6 +474,12 @@ func (c *Collector) isImpact(e events.PlayerHurt, hp int) bool {
 		if g.Thrower.SteamID64 != e.Attacker.SteamID64 || nadeKind(projectileType(g)) != nadeKind(e.Weapon.Type) {
 			continue
 		}
+		// An HE's hits on the tick it explodes are the explosion, however small (FRAG Midwest 3962 r30:
+		// the blast finished a 2-HP player with the projectile still beside him; the game counts it as
+		// utility damage).
+		if at, ok := c.log.boom[g.Entity.ID()]; ok && at == c.p.GameState().IngameTick() {
+			continue
+		}
 		if g.Position().Sub(body).Norm() <= impactReach {
 			return true
 		}
@@ -537,6 +548,10 @@ func (c *Collector) onNadeEvent(e events.GrenadeEventIf) {
 		return
 	}
 	b := e.Base()
+	if _, he := e.(events.HeExplode); he {
+		c.log.boom[b.GrenadeEntityID] = c.p.GameState().IngameTick()
+		c.heFrame = append(c.heFrame, heBlast{by: b.Thrower, pos: b.Position})
+	}
 	i, ok := c.log.nadeIdx[b.GrenadeEntityID]
 	if !ok || c.cur.Nades[i].DetT != 0 {
 		return
