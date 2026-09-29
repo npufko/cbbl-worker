@@ -2,6 +2,7 @@
 package stats
 
 import (
+	"math"
 	"sort"
 	"strconv"
 
@@ -160,6 +161,7 @@ type Collector struct {
 	// Deaths to "World" at one instant (see voidRound): when, how many, and the instant last voided.
 	worldAt, voidAt float64
 	worldN          int
+	worldHeld       []heldKill // post-round "World" deaths of the current instant (flushWorld)
 	teams           []*teamAcc
 	cur             *Round
 	roundStart      float64
@@ -176,11 +178,15 @@ type Collector struct {
 	mvps map[uint64]int
 	// Each victim's health after the last hit on them (see hpTaken).
 	hurtHP map[uint64]tickHP
-	check  checkState
+	// Each player's health at the last frame, and the health this frame's hurt events account for
+	// (see inferHits).
+	hpSeen    map[uint64]int
+	hurtFrame map[uint64]hurtSum
+	check     checkState
 }
 
 func NewCollector(p dem.Parser) *Collector {
-	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}, check: newCheckState(), hurtHP: map[uint64]tickHP{}}
+	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}, check: newCheckState(), hurtHP: map[uint64]tickHP{}, hpSeen: map[uint64]int{}, hurtFrame: map[uint64]hurtSum{}}
 	c.attach(p)
 	return c
 }
@@ -192,6 +198,7 @@ func NewCollector(p dem.Parser) *Collector {
 // the restore replayed rounds (rewind to it, which also drops the phantom round the restore itself
 // ends); 0 is a genuine restart.
 func (c *Collector) Continue(p dem.Parser) {
+	c.flushWorld()
 	c.endPostRound()
 	c.attach(p)
 	c.cur = nil
@@ -304,6 +311,7 @@ func (c *Collector) attach(p dem.Parser) {
 	p.RegisterEventHandler(c.onRoundEnd)
 	p.RegisterEventHandler(c.onRankUpdate)
 	p.RegisterEventHandler(c.onFrame)
+	p.RegisterEventHandler(c.onHealthFrame)
 	p.RegisterEventHandler(c.onFire)
 	p.RegisterEventHandler(c.onThrow)
 	p.RegisterEventHandler(c.onNadeEvent)
@@ -332,6 +340,7 @@ func (c *Collector) attach(p dem.Parser) {
 // so the round in progress is dropped now (it will be replayed either way) and the decision waits
 // for the next live RoundStart.
 func (c *Collector) onMatchStart(events.MatchStart) {
+	c.flushWorld()
 	c.endPostRound()
 	c.cur = nil
 	c.pendingRestart = true
@@ -422,6 +431,7 @@ func (c *Collector) player(pl *common.Player) *Player {
 func (c *Collector) now() float64 { return c.p.CurrentTime().Seconds() }
 
 func (c *Collector) onRoundStart(events.RoundStart) {
+	c.flushWorld()
 	c.creditMVP(c.playing())
 	c.endPostRound()
 	if !c.live() {
@@ -471,11 +481,17 @@ func (c *Collector) onKill(e events.Kill) {
 			c.worldAt, c.worldN = t, 0
 		}
 		if c.postRound {
-			// A restore or recording artifact after the round, or FACEIT slaying everyone once the
-			// match is over: not part of it. The game still credits an assist for the slain.
-			if e.Assister != nil && e.Assister.Team != e.Victim.Team {
-				c.check.leaveOut("assists", e.Assister, knownSlayAssist)
+			if c.p.GameState().GamePhase() == common.GamePhaseGameEnded {
+				c.leaveOutSlain(e) // FACEIT slaying everyone once the match is over: not part of it
+				return
 			}
+			// After the round, "World" is either one player dying (a fall: the game counts it, toasty,
+			// FRAG Jersey 2588 r7) or a restore / recording artifact slaying most of the server at once.
+			// Which one is known only when the instant is over: held until then (flushWorld).
+			if len(c.worldHeld) > 0 && c.worldHeld[0].t != t {
+				c.flushWorld()
+			}
+			c.worldHeld = append(c.worldHeld, heldKill{e: e, t: t})
 			return
 		}
 		if c.worldN++; c.worldN >= massWorldDeaths {
@@ -489,6 +505,39 @@ func (c *Collector) onKill(e events.Kill) {
 			return
 		}
 	}
+	c.recordKill(e, t)
+}
+
+// heldKill is a post-round "World" death waiting for its instant to end (see flushWorld).
+type heldKill struct {
+	e events.Kill
+	t float64
+}
+
+// flushWorld settles the post-round "World" deaths of the instant just over: a few are real deaths,
+// most of the server at once is not play (the game still credits an assist for the slain).
+func (c *Collector) flushWorld() {
+	held := c.worldHeld
+	c.worldHeld = nil
+	for _, h := range held {
+		if len(held) >= massWorldDeaths || c.cur == nil {
+			c.leaveOutSlain(h.e)
+			continue
+		}
+		c.recordKill(h.e, h.t)
+	}
+}
+
+// leaveOutSlain: a "World" death cbbl does not count. The game credits an assist to whoever damaged
+// the slain player; the self-check is told so it does not report that as a difference.
+func (c *Collector) leaveOutSlain(e events.Kill) {
+	if e.Assister != nil && e.Assister.Team != e.Victim.Team {
+		c.check.leaveOut("assists", e.Assister, knownSlayAssist)
+	}
+}
+
+// recordKill logs a kill (or a death with no enemy killer) and credits it.
+func (c *Collector) recordKill(e events.Kill, t float64) {
 	k := Kill{T: t - c.roundStart, Victim: strconv.FormatUint(e.Victim.SteamID64, 10), HS: e.IsHeadshot, Opening: len(c.cur.Kills) == 0}
 	if e.Weapon != nil {
 		k.Weapon = e.Weapon.String()
@@ -603,6 +652,83 @@ func (c *Collector) hpTaken(e events.PlayerHurt) int {
 // tickHP is a victim's health after the last hit on them, and the tick it landed.
 type tickHP struct{ tick, health int }
 
+// hurtSum is what one frame's hurt events took from a player, and how many hits.
+type hurtSum struct{ hp, hits int }
+
+// fireReach: a victim this close (2D) to a burning flame may be taking that fire's damage. 95% of
+// logged fire hits land within 77 units of the thrower's nearest flame (1,624 hits, 13 demos).
+const fireReach = 100.0
+
+// onHealthFrame: a demo can lack hurt events the game counted. FRAG Jersey 2579 r19: Galaxy's
+// molotov took 2+3+3 HP from skylar with no player_hurt in the file at all, yet the game credited
+// Galaxy the 8 (damage and utility damage). So each frame, a live player's health drop beyond what
+// that frame's hurt events explain (each hit may be 1 HP over its dmg_health, see hpTaken) is a missing
+// hit. Only a fire can be named as its source: when exactly one thrower's fire is burning within reach
+// of the victim, the hit is logged as that fire's, marked inferred. Anything else is left out, and the
+// self-check against the game's counters reports it. 26 FACEIT, Valve and pro demos: no such drop.
+func (c *Collector) onHealthFrame(events.FrameDone) {
+	c.flushWorld()
+	hurt := c.hurtFrame
+	c.hurtFrame = map[uint64]hurtSum{}
+	infer := c.cur != nil && c.live() && c.now() != c.voidAt
+	for _, pl := range c.playing() {
+		if pl.SteamID64 == 0 {
+			continue
+		}
+		h := pl.Health()
+		prev, seen := c.hpSeen[pl.SteamID64]
+		c.hpSeen[pl.SteamID64] = h
+		if !infer || !seen || !pl.IsAlive() || h >= prev {
+			continue // dead this frame: a death with no hurt event is not a fire's to claim
+		}
+		got := hurt[pl.SteamID64]
+		if gap := prev - h - got.hp; gap > got.hits {
+			c.inferFireHit(pl, gap)
+		}
+	}
+}
+
+// inferFireHit logs a missing hit of hp on victim, if exactly one thrower's fire can have dealt it.
+func (c *Collector) inferFireHit(victim *common.Player, hp int) {
+	pos := victim.Position()
+	var by *common.Player
+	for _, inf := range c.p.GameState().Infernos() {
+		th := inf.Thrower()
+		if th == nil {
+			continue
+		}
+		near := false
+		for _, f := range inf.Fires().Active().List() {
+			if math.Hypot(f.X-pos.X, f.Y-pos.Y) <= fireReach {
+				near = true
+				break
+			}
+		}
+		if !near {
+			continue
+		}
+		if by != nil && by.SteamID64 != th.SteamID64 {
+			return // two throwers' fires: whose it was cannot be told
+		}
+		by = th
+	}
+	if by == nil {
+		return
+	}
+	w := "Incendiary Grenade"
+	if by.Team == common.TeamTerrorists {
+		w = "Molotov"
+	}
+	c.cur.Damage = append(c.cur.Damage, Damage{T: c.roundT(), Attacker: sid(by), Victim: sid(victim), HP: hp, Weapon: w, Inferred: true})
+	if by.Team == victim.Team {
+		return // team damage: logged, never credited (as onHurt)
+	}
+	if a := c.player(by); a != nil {
+		a.Damage += hp
+		a.UtilDmg += hp
+	}
+}
+
 // creditMVP gives the round just completed its MVP from the scoreboard counters, for demos without
 // the round_mvp announcement (FACEIT CS2 demos have none: every MVP read 0). Called before the next
 // round starts and at the end: the one player whose count went up is the MVP. A counter that fell
@@ -634,6 +760,10 @@ func (c *Collector) onHurt(e events.PlayerHurt) {
 		return // the rest of a voided instant (a reset slays everyone: those hits are not play)
 	}
 	hp := c.hpTaken(e)
+	if e.Player != nil {
+		h := c.hurtFrame[e.Player.SteamID64]
+		c.hurtFrame[e.Player.SteamID64] = hurtSum{hp: h.hp + hp, hits: h.hits + 1}
+	}
 	c.logHurt(e, hp)
 	if c.cur == nil || e.Attacker == nil || e.Player == nil || e.Attacker.Team == e.Player.Team {
 		return
@@ -847,6 +977,7 @@ func (c *Collector) Result(mapName string) Result {
 	// round's MVP only after FACEIT has kicked the players (7 of 17 FACEIT maps), so it is on their
 	// controllers and nowhere else.
 	c.creditMVP(c.everyone())
+	c.flushWorld()
 	c.endPostRound()
 	// A restart with no round after it (the demo ends first): judge it on the final score.
 	c.settleRestart(c.p.GameState().TotalRoundsPlayed())

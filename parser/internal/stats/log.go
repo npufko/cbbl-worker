@@ -22,7 +22,9 @@ import (
 // damage but not as utility damage; v3 and older logs count it as both. Also: a killing hit in the
 // same tick as another hit on the victim no longer counts that hit's health twice, and coaches are
 // not players (no line, no round entry, not alive in a clutch).
-const LogVersion = 4
+// v5: fire hits missing from the demo, inferred from health (Damage.Inferred); a player dying alone
+// to "World" after the round (a fall) is a death, as the game counts it.
+const LogVersion = 5
 
 // v2: kills, damage, blinds and grenades between a round's end and the next round's start count for
 // the round that just ended (v1 dropped them: FACEIT and HLTV count exit frags).
@@ -61,6 +63,8 @@ type Damage struct {
 	HitGroup int     `json:"hg"` // events.HitGroup: 1 head, 2 chest, 3 stomach, 4-7 limbs, 0 generic
 	// A grenade hitting the victim in flight, not its explosion or fire (see isImpact).
 	Impact bool `json:"impact,omitempty"`
+	// A hit the demo has no hurt event for, read from the victim's health (see onHealthFrame).
+	Inferred bool `json:"inferred,omitempty"`
 }
 
 // Nade is one grenade: thrown and, when it went off, where and when.
