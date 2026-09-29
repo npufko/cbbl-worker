@@ -124,6 +124,9 @@ type Result struct {
 	// The two teams as the demo itself saw them. FACEIT and Valve matches get rosters from their own
 	// APIs; a LAN demo has nothing else, so this is where its teams and map winner come from.
 	Teams []Team `json:"teams"`
+	// The log checked against the game's own scoreboard counters (selfcheck.go). nil when the demo
+	// has none to read.
+	SelfCheck *SelfCheck `json:"selfCheck,omitempty"`
 }
 
 // Team is one side of the map, followed across the half-time swap by who is on it.
@@ -169,10 +172,15 @@ type Collector struct {
 	log     logState
 	lastPos map[uint64]posSample
 	speed   map[uint64]float64
+	// Each player's scoreboard MVP count as last seen (see creditMVP).
+	mvps map[uint64]int
+	// Each victim's health after the last hit on them (see hpTaken).
+	hurtHP map[uint64]tickHP
+	check  checkState
 }
 
 func NewCollector(p dem.Parser) *Collector {
-	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}}
+	c := &Collector{players: map[uint64]*Player{}, worldAt: -1, voidAt: -1, log: newLogState(), lastPos: map[uint64]posSample{}, speed: map[uint64]float64{}, check: newCheckState(), hurtHP: map[uint64]tickHP{}}
 	c.attach(p)
 	return c
 }
@@ -304,6 +312,9 @@ func (c *Collector) attach(p dem.Parser) {
 	p.RegisterEventHandler(c.onDefused)
 	p.RegisterEventHandler(c.onExploded)
 	p.RegisterEventHandler(c.onMVP)
+	p.RegisterEventHandler(c.onDisconnect)
+	p.RegisterEventHandler(c.onRoundOfficial)
+	p.RegisterEventHandler(c.onCheckFrame)
 	c.lastPos = map[uint64]posSample{} // positions do not carry across recording segments
 }
 
@@ -348,6 +359,7 @@ func (c *Collector) rewind(n int) {
 	c.restores++
 	c.rounds = c.rounds[:n]
 	c.snapshots = c.snapshots[:n]
+	c.check.rewindCheck(n)
 	c.players = map[uint64]*Player{}
 	c.cur = nil
 	if n == 0 {
@@ -377,6 +389,7 @@ func (c *Collector) reset() {
 	c.postRound = false
 	c.restarts++
 	c.rounds = nil
+	c.check = newCheckState()
 	c.teams = nil
 	c.snapshots = nil
 	c.players = map[uint64]*Player{}
@@ -409,11 +422,16 @@ func (c *Collector) player(pl *common.Player) *Player {
 func (c *Collector) now() float64 { return c.p.CurrentTime().Seconds() }
 
 func (c *Collector) onRoundStart(events.RoundStart) {
+	c.creditMVP(c.playing())
 	c.endPostRound()
 	if !c.live() {
 		return
 	}
 	c.settleRestart(c.p.GameState().TotalRoundsPlayed())
+	if len(c.rounds) > 0 && !c.segmentStart {
+		c.commitRounds()
+		c.selfCheck(c.playing())
+	}
 	c.cur = newRound(len(c.rounds)+1, c.now())
 	c.roundStart = c.now()
 	c.log = newLogState()
@@ -429,7 +447,7 @@ func (c *Collector) onFreezeEnd(events.RoundFreezetimeEnd) {
 	}
 	c.cur.FreezeEnd = c.roundT()
 	c.logFreezeEnd()
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		switch pl.Team {
 		case common.TeamCounterTerrorists:
 			c.cur.Equip[0] += pl.EquipmentValueFreezeTimeEnd()
@@ -453,10 +471,21 @@ func (c *Collector) onKill(e events.Kill) {
 			c.worldAt, c.worldN = t, 0
 		}
 		if c.postRound {
-			return // a restore or recording artifact after the round: not part of it
+			// A restore or recording artifact after the round, or FACEIT slaying everyone once the
+			// match is over: not part of it. The game still credits an assist for the slain.
+			if e.Assister != nil && e.Assister.Team != e.Victim.Team {
+				c.check.leaveOut("assists", e.Assister, knownSlayAssist)
+			}
+			return
 		}
 		if c.worldN++; c.worldN >= massWorldDeaths {
 			c.voidRound(t)
+			return
+		}
+		// A bot dying to "World" is the game removing it: its player came back and takes over its
+		// body (kevin, 1-5b0b4db1 r5). Nobody died; logging it gave a phantom player "0" a death.
+		if e.Victim.SteamID64 == 0 {
+			c.checkClutch()
 			return
 		}
 	}
@@ -526,7 +555,7 @@ func (c *Collector) onKill(e events.Kill) {
 // checkClutch records the first moment a team is down to one player against ≥1 enemies.
 func (c *Collector) checkClutch() {
 	alive := map[common.Team][]*common.Player{}
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		if pl.IsAlive() {
 			alive[pl.Team] = append(alive[pl.Team], pl)
 		}
@@ -542,8 +571,70 @@ func (c *Collector) checkClutch() {
 	}
 }
 
+// hpTaken is the health a hit actually took. The game's dmg_health drops the fraction of CS2's
+// float damage while the victim's health falls by the rounded amount, so dmg_health loses up to 1 HP
+// a hit (a kill's hits summed to 97-99, and ADR ran ~1.5% under FACEIT's). The victim's health
+// before the hit minus after is exact; it is trusted only when it differs by that rounding, so a
+// stale entity value can never inflate a hit.
+//
+// "Before" is the entity's health, except after an earlier hit on the same victim in the same tick:
+// the entity still shows the health from before both, so the earlier hit's health-after is used. On
+// a killing hit the library caps dmg_health at the entity's health, which then counts the earlier
+// hit twice (a 15 and a killing 70 on a 70-HP player: the game credits the kill 55).
+func (c *Collector) hpTaken(e events.PlayerHurt) int {
+	if e.Player == nil {
+		return e.HealthDamageTaken
+	}
+	tick := c.p.GameState().IngameTick()
+	before := e.Player.Health()
+	if h, ok := c.hurtHP[e.Player.SteamID64]; ok && h.tick == tick {
+		before = h.health
+	}
+	c.hurtHP[e.Player.SteamID64] = tickHP{tick: tick, health: e.Health}
+	if e.Health <= 0 {
+		return min(e.HealthDamageTaken, max(before, 0))
+	}
+	if d := before - e.Health; d == e.HealthDamageTaken+1 || d == e.HealthDamageTaken {
+		return d
+	}
+	return e.HealthDamageTaken
+}
+
+// tickHP is a victim's health after the last hit on them, and the tick it landed.
+type tickHP struct{ tick, health int }
+
+// creditMVP gives the round just completed its MVP from the scoreboard counters, for demos without
+// the round_mvp announcement (FACEIT CS2 demos have none: every MVP read 0). Called before the next
+// round starts and at the end: the one player whose count went up is the MVP. A counter that fell
+// (restart, restore) only resets the baseline; two risers at once credit nobody rather than guess.
+func (c *Collector) creditMVP(players []*common.Player) {
+	if c.mvps == nil {
+		c.mvps = map[uint64]int{}
+	}
+	var mvp uint64
+	risen := 0
+	for _, pl := range players {
+		n := pl.MVPs()
+		if prev, seen := c.mvps[pl.SteamID64]; seen && n > prev {
+			mvp = pl.SteamID64
+			risen++
+		}
+		c.mvps[pl.SteamID64] = n
+	}
+	if risen == 1 && len(c.rounds) > 0 && c.rounds[len(c.rounds)-1].MVP == "" {
+		c.rounds[len(c.rounds)-1].MVP = strconv.FormatUint(mvp, 10)
+	}
+}
+
 func (c *Collector) onHurt(e events.PlayerHurt) {
-	c.logHurt(e)
+	if isCoach(e.Player) {
+		return // the game's own 0-damage slay of the coach at freeze-time end
+	}
+	if c.now() == c.voidAt {
+		return // the rest of a voided instant (a reset slays everyone: those hits are not play)
+	}
+	hp := c.hpTaken(e)
+	c.logHurt(e, hp)
 	if c.cur == nil || e.Attacker == nil || e.Player == nil || e.Attacker.Team == e.Player.Team {
 		return
 	}
@@ -551,13 +642,16 @@ func (c *Collector) onHurt(e events.PlayerHurt) {
 	if a == nil {
 		return
 	}
-	a.Damage += e.HealthDamageTaken
+	a.Damage += hp
 	if e.Weapon != nil && e.Weapon.Class() == common.EqClassGrenade {
-		a.UtilDmg += e.HealthDamageTaken
+		a.UtilDmg += hp
 	}
 }
 
 func (c *Collector) onFlashed(e events.PlayerFlashed) {
+	if isCoach(e.Player) {
+		return
+	}
 	c.logBlind(e)
 	if c.cur == nil || e.Attacker == nil || e.Player == nil || e.Attacker.Team == e.Player.Team {
 		return
@@ -579,7 +673,7 @@ func (c *Collector) onRoundEnd(e events.RoundEnd) {
 	c.cur.Reason = int(e.Reason)
 	c.cur.Winner = map[common.Team]string{common.TeamCounterTerrorists: "CT", common.TeamTerrorists: "T"}[e.Winner]
 	// KAST survival: anyone playing who did not die this round.
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		if _, dead := c.died[pl.SteamID64]; !dead {
 			c.contributed[pl.SteamID64] = true
 		}
@@ -591,7 +685,7 @@ func (c *Collector) onRoundEnd(e events.RoundEnd) {
 	}
 	// Ensure every participant exists even with zero events, and refresh rank while the entity is
 	// still around — a player who disconnects before the end takes their entity with them.
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		if x := c.player(pl); x != nil {
 			if t := pl.RankType(); t > 0 {
 				x.RankType = t
@@ -654,7 +748,7 @@ func (c *Collector) sideTeams() int {
 	ids := func(ts *common.TeamState) []string {
 		out := []string{}
 		for _, pl := range ts.Members() {
-			if pl != nil && pl.SteamID64 != 0 {
+			if pl != nil && pl.SteamID64 != 0 && !isCoach(pl) {
 				out = append(out, strconv.FormatUint(pl.SteamID64, 10))
 			}
 		}
@@ -749,9 +843,18 @@ func (c *Collector) playerByID(id string) *Player {
 func (c *Collector) Rounds() []Round { return c.rounds }
 
 func (c *Collector) Result(mapName string) Result {
+	// Everyone, the departed included: when the match ends on its last kill, the game names that
+	// round's MVP only after FACEIT has kicked the players (7 of 17 FACEIT maps), so it is on their
+	// controllers and nowhere else.
+	c.creditMVP(c.everyone())
 	c.endPostRound()
 	// A restart with no round after it (the demo ends first): judge it on the final score.
 	c.settleRestart(c.p.GameState().TotalRoundsPlayed())
+	if len(c.rounds) > 0 && !c.pendingRestart && !c.segmentStart {
+		c.commitRounds()
+		c.selfCheck(c.playing())
+		c.check.finalMVPs(c.everyone(), logTotals(c.rounds))
+	}
 	n := len(c.rounds)
 	out := make([]*Player, 0, len(c.players))
 	for _, x := range c.players {
@@ -774,7 +877,15 @@ func (c *Collector) Result(mapName string) Result {
 		}
 		return gs.TeamTerrorists().Score()
 	}
-	return Result{LogVersion: LogVersion, Mode: c.mode(), Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts, Restores: c.restores, Teams: c.teamResults(gameScore)}
+	teams := c.teamResults(gameScore)
+	sc := c.checkResult()
+	if sc == nil { // a demo without the counters still gets its invariants checked
+		sc = &SelfCheck{OK: true, Stats: []StatCheck{}, Diffs: []CheckDiff{}}
+	}
+	if sc.Broken = checkInvariants(c.rounds, teams); len(sc.Broken) > 0 {
+		sc.OK = false
+	}
+	return Result{LogVersion: LogVersion, Mode: c.mode(), Map: mapName, TickRate: c.p.TickRate(), Rounds: c.rounds, Players: out, Restarts: c.restarts, Restores: c.restores, Teams: teams, SelfCheck: sc}
 }
 
 // mode reads the rank type the players were queued under. Empty when the demo did not come from a
@@ -802,4 +913,39 @@ func (c *Collector) mode() string {
 	default:
 		return ""
 	}
+}
+
+// playing is everyone on T or CT who plays: a coach is on the team (and, to the library, alive) but
+// never plays, and would otherwise get a stat line, a roster spot and keep their side "alive" in
+// every clutch.
+func (c *Collector) playing() []*common.Player {
+	all := c.p.GameState().Participants().Playing()
+	out := all[:0:0]
+	for _, pl := range all {
+		if !isCoach(pl) {
+			out = append(out, pl)
+		}
+	}
+	return out
+}
+
+func isCoach(pl *common.Player) bool {
+	if pl == nil || pl.Entity == nil {
+		return false
+	}
+	v, ok := pl.Entity.PropertyValue("m_iCoachingTeam")
+	return ok && v.Any != nil && v.Int() != 0
+}
+
+// everyone: every player with a stat line whose controller is still there, including players who
+// left. Only for what the game settles after the match (the final round's MVP): a departed
+// controller also collects deaths from the match-end slay, which were never played.
+func (c *Collector) everyone() []*common.Player {
+	out := []*common.Player{}
+	for _, pl := range c.p.GameState().Participants().All() {
+		if pl != nil && pl.SteamID64 != 0 && pl.Entity != nil && !isCoach(pl) && c.players[pl.SteamID64] != nil {
+			out = append(out, pl)
+		}
+	}
+	return out
 }

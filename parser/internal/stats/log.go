@@ -16,7 +16,13 @@ import (
 //
 // LogVersion goes up whenever a fact is added or its meaning changes; a stat declares the version it
 // needs and reads "—" on older maps rather than guessing.
-const LogVersion = 2
+// v3: damage is the health each hit actually took (hpTaken), and round MVPs come from the scoreboard
+// counters when the demo has no announcement (FACEIT). v2 logs undercount damage by up to 1 HP a hit.
+// v4: Damage.Impact marks a grenade striking a player in flight (1-2 HP). The game counts it as
+// damage but not as utility damage; v3 and older logs count it as both. Also: a killing hit in the
+// same tick as another hit on the victim no longer counts that hit's health twice, and coaches are
+// not players (no line, no round entry, not alive in a clutch).
+const LogVersion = 4
 
 // v2: kills, damage, blinds and grenades between a round's end and the next round's start count for
 // the round that just ended (v1 dropped them: FACEIT and HLTV count exit frags).
@@ -53,6 +59,8 @@ type Damage struct {
 	Armor    int     `json:"ar"`
 	Weapon   string  `json:"w"`
 	HitGroup int     `json:"hg"` // events.HitGroup: 1 head, 2 chest, 3 stomach, 4-7 limbs, 0 generic
+	// A grenade hitting the victim in flight, not its explosion or fire (see isImpact).
+	Impact bool `json:"impact,omitempty"`
 }
 
 // Nade is one grenade: thrown and, when it went off, where and when.
@@ -77,7 +85,7 @@ type At struct {
 // around: every living player at this instant, except those named.
 func (c *Collector) around(except ...*common.Player) []At {
 	out := []At{}
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		if !pl.IsAlive() || pl.SteamID64 == 0 {
 			continue
 		}
@@ -264,7 +272,7 @@ func (c *Collector) roundPlayer(pl *common.Player) *RoundPlayer {
 
 // logFreezeEnd records every player's loadout once buys are done.
 func (c *Collector) logFreezeEnd() {
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		rp := c.roundPlayer(pl)
 		if rp == nil {
 			continue
@@ -291,7 +299,7 @@ func (c *Collector) logFreezeEnd() {
 
 // logRoundEnd records how everyone finished the round.
 func (c *Collector) logRoundEnd() {
-	for _, pl := range c.p.GameState().Participants().Playing() {
+	for _, pl := range c.playing() {
 		rp := c.roundPlayer(pl)
 		if rp == nil {
 			continue
@@ -309,7 +317,7 @@ func (c *Collector) onFrame(events.FrameDone) {
 		return
 	}
 	now := c.now()
-	playing := c.p.GameState().Participants().Playing()
+	playing := c.playing()
 	for _, pl := range playing {
 		if !pl.IsAlive() {
 			continue
@@ -401,7 +409,7 @@ func (c *Collector) onFire(e events.WeaponFire) {
 }
 
 // logHurt records the hit, gun accuracy, and closes an aim sample on the first damage of a sighting.
-func (c *Collector) logHurt(e events.PlayerHurt) {
+func (c *Collector) logHurt(e events.PlayerHurt, hp int) {
 	if c.cur == nil || e.Player == nil {
 		return
 	}
@@ -410,7 +418,7 @@ func (c *Collector) logHurt(e events.PlayerHurt) {
 		w = e.Weapon.String()
 	}
 	c.cur.Damage = append(c.cur.Damage, Damage{T: c.roundT(), Attacker: sid(e.Attacker), Victim: sid(e.Player),
-		HP: e.HealthDamageTaken, Armor: e.ArmorDamageTaken, Weapon: w, HitGroup: int(e.HitGroup)})
+		HP: hp, Armor: e.ArmorDamageTaken, Weapon: w, HitGroup: int(e.HitGroup), Impact: c.isImpact(e, hp)})
 	if e.Attacker == nil || e.Attacker.Team == e.Player.Team || !isGun(e.Weapon) {
 		return
 	}
@@ -435,11 +443,75 @@ func (c *Collector) logHurt(e events.PlayerHurt) {
 	}
 }
 
+// A grenade striking a player: how close (units, from the victim's mid-body; a player is ~72 tall,
+// ~32 wide) the attacker's projectile must be, and the most health it takes (seen: 1-2 HP).
+const (
+	impactReach = 64.0
+	impactMaxHP = 5
+)
+
+// isImpact: the hit came from a grenade of the attacker's that is still flying, touching the victim.
+// Fire comes after a molotov's projectile is gone; an HE's projectile is still there on the tick it
+// detonates, but a blast that close takes far more than an impact does.
+func (c *Collector) isImpact(e events.PlayerHurt, hp int) bool {
+	if hp > impactMaxHP || e.Weapon == nil || e.Weapon.Class() != common.EqClassGrenade || e.Attacker == nil || e.Player == nil {
+		return false
+	}
+	body := e.Player.Position().Add(r3.Vector{Z: 36})
+	for _, g := range c.p.GameState().GrenadeProjectiles() {
+		if g == nil || g.Entity == nil || g.Thrower == nil {
+			continue
+		}
+		if g.Thrower.SteamID64 != e.Attacker.SteamID64 || nadeKind(projectileType(g)) != nadeKind(e.Weapon.Type) {
+			continue
+		}
+		if g.Position().Sub(body).Norm() <= impactReach {
+			return true
+		}
+	}
+	return false
+}
+
+// projectileType is the grenade a projectile is. The library knows it from the projectile's model,
+// and a projectile can arrive without one ("unknown grenade model 0": an HE in a Premier match,
+// dropped from the log). Its entity class names the grenade either way; a molotov-class projectile
+// with no model is logged as a molotov (one kind with the incendiary, see nadeKind).
+func projectileType(g *common.GrenadeProjectile) common.EquipmentType {
+	if g.WeaponInstance != nil && g.WeaponInstance.Type != common.EqUnknown {
+		return g.WeaponInstance.Type
+	}
+	if g.Entity == nil {
+		return common.EqUnknown
+	}
+	switch g.Entity.ServerClass().Name() {
+	case "CHEGrenadeProjectile":
+		return common.EqHE
+	case "CFlashbangProjectile":
+		return common.EqFlash
+	case "CSmokeGrenadeProjectile":
+		return common.EqSmoke
+	case "CMolotovProjectile":
+		return common.EqMolotov
+	case "CDecoyProjectile":
+		return common.EqDecoy
+	}
+	return common.EqUnknown
+}
+
+// nadeKind: molotov and incendiary are one kind here. A T throwing a picked-up incendiary hits
+// people as "Molotov" (Stx, 1-5b0b4db1 r15), so the hit and its projectile disagree on the name.
+func nadeKind(t common.EquipmentType) common.EquipmentType {
+	if t == common.EqIncendiary {
+		return common.EqMolotov
+	}
+	return t
+}
+
 func (c *Collector) onThrow(e events.GrenadeProjectileThrow) {
-	if c.cur == nil || e.Projectile == nil || e.Projectile.WeaponInstance == nil {
+	if c.cur == nil || e.Projectile == nil || e.Projectile.Entity == nil {
 		return
 	}
-	name, ok := nadeName[e.Projectile.WeaponInstance.Type]
+	name, ok := nadeName[projectileType(e.Projectile)]
 	if !ok {
 		return
 	}
@@ -476,10 +548,10 @@ func (c *Collector) onNadeEvent(e events.GrenadeEventIf) {
 // onNadeDestroy: molotovs and incendiaries land when their projectile goes; CS2 demos do not
 // reliably send their fire-start event, so this is where they "go off".
 func (c *Collector) onNadeDestroy(e events.GrenadeProjectileDestroy) {
-	if c.cur == nil || e.Projectile == nil || e.Projectile.Entity == nil || e.Projectile.WeaponInstance == nil {
+	if c.cur == nil || e.Projectile == nil || e.Projectile.Entity == nil {
 		return
 	}
-	if t := e.Projectile.WeaponInstance.Type; t != common.EqMolotov && t != common.EqIncendiary {
+	if t := projectileType(e.Projectile); t != common.EqMolotov && t != common.EqIncendiary {
 		return
 	}
 	i, ok := c.log.nadeIdx[e.Projectile.Entity.ID()]

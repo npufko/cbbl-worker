@@ -71,6 +71,21 @@ func main() {
 	}
 
 	result := c.Result(mapName)
+	// The self-check travels in the JSON; a failure is also said here, for the Actions log.
+	if sc := result.SelfCheck; sc != nil && !sc.OK {
+		for _, b := range sc.Broken {
+			fmt.Fprintf(os.Stderr, "self-check: broken %q round %d: %s\n", b.Rule, b.Round, b.Detail)
+		}
+		scored := map[string]bool{}
+		for _, s := range sc.Stats {
+			scored[s.Stat] = s.Scored
+		}
+		for _, d := range sc.Diffs {
+			if d.Known == "" && scored[d.Stat] {
+				fmt.Fprintf(os.Stderr, "self-check: %s %s (%s) ours %d, game %d, since round %d\n", d.Stat, d.Name, d.SteamID, d.Ours, d.Game, d.Round)
+			}
+		}
+	}
 	w := os.Stdout
 	if *out != "-" {
 		var err error
