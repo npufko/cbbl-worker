@@ -37,7 +37,8 @@ jobs:
           go build -o ../worker/cbbl-parse ./cmd/cbbl-parse
       - name: Install worker deps
         working-directory: worker
-        run: npm install --no-audit --no-fund
+        # Lockfile only: this job holds STEAM_REFRESH_TOKEN, so no floating transitive versions.
+        run: npm ci --no-audit --no-fund
       - name: Walk share codes
         working-directory: worker
         env:
@@ -45,7 +46,7 @@ jobs:
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
           STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
           MATCH_AUTH_CODE: ${{ secrets.MATCH_AUTH_CODE }}
+          VALVE_AUTH_PRIVATE_KEY: ${{ secrets.VALVE_AUTH_PRIVATE_KEY }}
           STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
           VALVE_SEED_CODE: ${{ secrets.VALVE_SEED_CODE }}
-          FORCE_SHARE_CODE: ${{ inputs.share_code }}
         run: node src/valve-discover.mjs

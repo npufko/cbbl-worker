@@ -6,6 +6,7 @@
 // next code -> the GC turns it into a public replay URL -> download, parse, hand both halves to
 // cbbl, which builds the match and advances the cursor.
 import { execFile } from 'node:child_process';
+import { constants, privateDecrypt } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
@@ -13,11 +14,24 @@ import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import SteamUser from 'steam-user';
 import GlobalOffensive from 'globaloffensive';
+import { eventPayload, mask as hide } from './log-safety.mjs';
 
 const run = promisify(execFile);
-const { CBBL_URL, WORKER_SECRET, STEAM_API_KEY, MATCH_AUTH_CODE, STEAM_REFRESH_TOKEN, VALVE_SEED_CODE } = process.env;
-for (const [k, v] of Object.entries({ CBBL_URL, WORKER_SECRET, STEAM_API_KEY, MATCH_AUTH_CODE, STEAM_REFRESH_TOKEN })) {
+const { CBBL_URL, WORKER_SECRET, STEAM_API_KEY, MATCH_AUTH_CODE, STEAM_REFRESH_TOKEN, VALVE_SEED_CODE, VALVE_AUTH_PRIVATE_KEY } = process.env;
+for (const [k, v] of Object.entries({ CBBL_URL, WORKER_SECRET, STEAM_API_KEY, STEAM_REFRESH_TOKEN })) {
   if (!v) throw new Error(`missing env ${k}`);
+}
+
+// Auth codes. A player who set up on /setup comes with their own code, sealed by cbbl with the
+// public key (packages/core/src/steam/authcode.ts: RSA-OAEP, SHA-256); only this job holds the
+// private key (base64 of the PEM, one line, so Actions masks it whole). Tracked players who have not
+// set up fall back to MATCH_AUTH_CODE, as before. Every opened code is masked before use.
+function authCodeFor(sealed) {
+  if (!sealed) return MATCH_AUTH_CODE || null;
+  if (!VALVE_AUTH_PRIVATE_KEY) throw new Error('a player set up, but VALVE_AUTH_PRIVATE_KEY is missing');
+  const key = Buffer.from(VALVE_AUTH_PRIVATE_KEY, 'base64').toString('utf8');
+  const code = privateDecrypt({ key, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' }, Buffer.from(sealed, 'base64')).toString('utf8');
+  return hide(code);
 }
 const MAX_PER_RUN = Number(process.env.MAX_MATCHES_PER_RUN ?? 3); // polite to Valve, and keeps a run short
 const auth = { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'application/json' };
@@ -28,12 +42,14 @@ const auth = { Authorization: `Bearer ${WORKER_SECRET}`, 'Content-Type': 'applic
 // log would also be a public record of who played what and when.
 //
 // `::add-mask::` makes Actions redact the value anywhere it appears afterwards — including inside
-// cbbl's JSON response, which echoes the cursor back. Mask first, then log.
-const hide = (code) => { if (code) console.log(`::add-mask::${code}`); return code; };
+// cbbl's JSON response, which echoes the cursor back. Mask first, then log. SteamIDs are masked and
+// logged as "player N" for the same reason: no public record of who played when.
 const short = (code) => `${code.slice(0, 9)}…${code.slice(-5)}`; // CSGO-wnDur…KtcZH
 
+// A workflow_dispatch input is read from the event file: through `env:` it would be printed in the
+// step's log header before this line could mask it.
+const FORCE_SHARE_CODE = hide(String(eventPayload().share_code ?? '').trim());
 hide(VALVE_SEED_CODE);
-hide(process.env.FORCE_SHARE_CODE);
 
 // Valve replays are plain http on replay<N>.valve.net. That exact pattern is allowed and nothing
 // else is: a blanket http allowance would turn this job into an open proxy over cleartext.
@@ -43,10 +59,11 @@ function assertValveReplay(url) {
   if (!ok) throw new Error(`refusing non-Valve replay host: ${u.protocol}//${u.hostname}`);
 }
 
-async function nextShareCode(steamId, knownCode) {
-  const q = new URLSearchParams({ key: STEAM_API_KEY, steamid: steamId, steamidkey: MATCH_AUTH_CODE, knowncode: knownCode });
+async function nextShareCode(steamId, authCode, knownCode) {
+  const q = new URLSearchParams({ key: STEAM_API_KEY, steamid: steamId, steamidkey: authCode, knowncode: knownCode });
   const res = await fetch(`https://api.steampowered.com/ICSGOPlayers_730/GetNextMatchSharingCode/v1?${q}`, { signal: AbortSignal.timeout(10_000) });
   if (res.status === 202) return null; // caught up
+  if (res.status === 403) throw new Error('GetNextMatchSharingCode 403: auth code rejected (reset on Steam?)');
   if (!res.ok) throw new Error(`GetNextMatchSharingCode ${res.status}`);
   const next = (await res.json())?.result?.nextcode;
   return next && next !== 'n/a' ? next : null;
@@ -83,30 +100,35 @@ await gcReady;
 console.log('GC connected');
 
 let { players } = await (await fetch(`${CBBL_URL}/api/ingest/valve`, { headers: auth })).json();
+for (const p of players) { hide(p.steamId); hide(p.lastCode); }
 console.log(`${players.length} tracked player(s)`);
 
 // One named share code, for testing and for backfilling a match the walk has already passed.
 // It does not move the cursor backwards: the code is processed, then the cursor is set to it.
-const forced = (process.env.FORCE_SHARE_CODE ?? '').trim();
+const forced = FORCE_SHARE_CODE;
 if (forced) {
   console.log(`forced share code: ${short(forced)}`);
   players = players.slice(0, 1).map((p) => ({ ...p, forced }));
 }
 
 let ingested = 0;
-for (const { steamId, lastCode, forced: forcedCode } of players) {
+for (const [pi, { steamId, lastCode, sealedAuth, forced: forcedCode }] of players.entries()) {
+  const who = `player ${pi + 1}`;
   let cursor = lastCode ?? VALVE_SEED_CODE;
-  if (!cursor && !forcedCode) { console.log(`${steamId}: no cursor and no VALVE_SEED_CODE — skipping`); continue; }
+  if (!cursor && !forcedCode) { console.log(`${who}: no cursor and no VALVE_SEED_CODE — skipping`); continue; }
+  let authCode;
+  try { authCode = authCodeFor(sealedAuth); } catch (e) { console.error(`${who}: ${e.message}`); continue; }
+  if (!authCode && !forcedCode) { console.log(`${who}: no auth code — skipping`); continue; }
 
   for (let n = 0; n < MAX_PER_RUN; n++) {
     const code = forcedCode && n === 0
       ? forcedCode
       : forcedCode
         ? null
-        : await nextShareCode(steamId, cursor).catch((e) => { console.error(`  ${e.message}`); return null; });
+        : await nextShareCode(steamId, authCode, cursor).catch((e) => { console.error(`  ${e.message}`); return null; });
     if (!code) break;
     hide(code);
-    console.log(`${steamId}: ${short(code)}`);
+    console.log(`${who}: ${short(code)}`);
     cursor = code;
 
     try {
