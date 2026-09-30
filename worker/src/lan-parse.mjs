@@ -7,14 +7,16 @@ import { readFile, rm, stat } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { promisify } from 'node:util';
+import { eventPayload, safeError } from './log-safety.mjs';
 
 const run = promisify(execFile);
-const { EVENT_ID, FILES, CBBL_URL, WORKER_SECRET, GOOGLE_DRIVE_API_KEY } = process.env;
-if (!EVENT_ID || !FILES || !CBBL_URL || !WORKER_SECRET || !GOOGLE_DRIVE_API_KEY) throw new Error('missing env');
+const { CBBL_URL, WORKER_SECRET, GOOGLE_DRIVE_API_KEY } = process.env;
+const { eventId: EVENT_ID, files: FILES } = eventPayload(); // event file, not env: see log-safety.mjs
+if (!EVENT_ID || !Array.isArray(FILES) || !CBBL_URL || !WORKER_SECRET || !GOOGLE_DRIVE_API_KEY) throw new Error('missing env');
 
 // The dispatch payload only ever names Drive file ids; the URL is built here, so this job can never
 // be pointed at another host.
-const files = JSON.parse(FILES).filter((f) => /^[A-Za-z0-9_-]{10,100}$/.test(f?.fileId ?? ''));
+const files = FILES.filter((f) => /^[A-Za-z0-9_-]{10,100}$/.test(f?.fileId ?? ''));
 
 async function report(fileId, body) {
   const res = await fetch(`${CBBL_URL}/api/ingest/lan`, {
@@ -86,8 +88,8 @@ for (const [gi, g] of groups.entries()) {
     else failures++;
   } catch (e) {
     failures++;
-    // Never echo the URL: it carries the API key.
-    const why = String(e?.message ?? e).replace(/key=[^&\s]+/g, 'key=…').slice(0, 300);
+    // Never echo the URL (it carries the API key) or the parser's self-check lines.
+    const why = safeError(e);
     console.error(`  failed: ${why}`);
     await report(target.fileId, { error: why, merged }).catch(() => {});
   } finally {

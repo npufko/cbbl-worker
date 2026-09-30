@@ -1,5 +1,7 @@
 # Public worker repo → unlimited standard-runner minutes. Only repository_dispatch can trigger it;
 # no pull_request triggers, so forks can never run with these secrets.
+# Logs are public: the dispatch payload (presigned demo URL) is read from the event file, never
+# passed through env, which Actions prints unmasked. See SECURITY.md.
 name: parse-demo
 on:
   repository_dispatch:
@@ -29,12 +31,9 @@ jobs:
       - name: Download, parse, report
         working-directory: worker
         env:
-          DOC_ID: ${{ github.event.client_payload.docId }}
-          DEMO_URL: ${{ github.event.client_payload.url }}
-          DEMO_NAME: ${{ github.event.client_payload.demo }}
           CBBL_URL: ${{ secrets.CBBL_URL }}
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
           ALLOWED_HOSTS: ${{ vars.DEMO_URL_HOSTS }}
           DISCORD_MATCHES_WEBHOOK: ${{ secrets.DISCORD_MATCHES_WEBHOOK }}
-          TRACKED_STEAM_IDS: ${{ vars.TRACKED_STEAM_IDS }}
+          TRACKED_STEAM_IDS: ${{ secrets.TRACKED_STEAM_IDS }}
         run: node src/parse-job.mjs
