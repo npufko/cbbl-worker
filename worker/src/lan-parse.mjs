@@ -30,15 +30,17 @@ async function report(fileId, body) {
 }
 
 /**
- * Drive turning downloads away for a while (its "automated queries" page, a rate or download-quota
- * error, 429 or 5xx) is not the demo's fault: cbbl queues it again. Anything else (a file no longer
- * shared, say) is a real failure.
+ * Drive turning downloads away is not the demo's fault: cbbl queues it again. 'quota': the file
+ * OWNER's download quota is used up (every file of theirs is refused, to anyone, for about a day), so
+ * cbbl pauses that owner. 'busy': a short block ("automated queries", a rate limit, 429 or 5xx).
+ * null: a real failure (a file no longer shared, say).
  */
 async function driveRefusal(res) {
-  if (res.status === 429 || res.status >= 500) return true;
-  if (res.status !== 403) return false;
+  if (res.status === 429 || res.status >= 500) return 'busy';
+  if (res.status !== 403) return null;
   const text = (await res.text().catch(() => '')).slice(0, 4000);
-  return /automated queries|rateLimitExceeded|userRateLimitExceeded|downloadQuotaExceeded|quotaExceeded/i.test(text);
+  if (/downloadQuotaExceeded|quotaExceeded/i.test(text)) return 'quota';
+  return /automated queries|rateLimitExceeded|userRateLimitExceeded/i.test(text) ? 'busy' : null;
 }
 
 // One map per group: its recording segments (FRAG: <map>_<id>.dem, then _1 …), in the order sent,
@@ -60,22 +62,22 @@ for (const [gi, g] of groups.entries()) {
   const paths = g.files.map((_, i) => `lan-${i}.dem`);
   console.log(g.files.map((f) => f.name ?? f.fileId).join(' + '));
   try {
-    let refused = null;
+    let refused = null, kind = null;
     for (const [i, { fileId }] of g.files.entries()) {
       const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${encodeURIComponent(GOOGLE_DRIVE_API_KEY)}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(15 * 60_000) });
-      if (!res.ok && (await driveRefusal(res))) { refused = res.status; break; }
+      if (!res.ok && (kind = await driveRefusal(res))) { refused = res.status; break; }
       if (!res.ok || !res.body) throw new Error(`Drive download ${res.status}`);
       await pipeline(Readable.fromWeb(res.body), createWriteStream(paths[i]));
       console.log(`  downloaded ${(await stat(paths[i])).size} bytes`);
     }
     if (refused !== null) {
       // Stop here rather than hammer Drive: this map and the rest of the batch go back in the queue.
-      const why = `Drive refused the download (${refused}); queued again`;
+      const why = kind === 'quota' ? `Drive download quota used up (${refused}); queued again` : `Drive refused the download (${refused}); queued again`;
       const rest = groups.slice(gi);
       console.error(`  ${why}: handing back ${rest.length} map(s)`);
       for (const r of rest) {
-        await report(r.files.at(-1).fileId, { error: why, retry: true, merged: r.files.slice(0, -1).map((f) => f.fileId) }).catch(() => {});
+        await report(r.files.at(-1).fileId, { error: why, retry: true, quota: kind === 'quota', merged: r.files.slice(0, -1).map((f) => f.fileId) }).catch(() => {});
       }
       break;
     }
