@@ -1,0 +1,32 @@
+# LAN flow: follow a live event closely. One job calls cbbl's LAN sync every 3 minutes for up to
+# 5.5 h, then starts the next run of itself (GitHub lets GITHUB_TOKEN start workflow_dispatch runs).
+# It stops by itself once cbbl reports nothing live. Started by cbbl (repository_dispatch lan-live)
+# whenever a sync finds a live event and this loop has not checked in for 8 minutes; lan-poll's cron
+# is the backstop that restarts it. Public repo: standard-runner minutes are free.
+name: lan-live
+on:
+  repository_dispatch:
+    types: [lan-live]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write # only to start the next run of this workflow
+concurrency:
+  group: lan-live # never two loops; a new start waits for the running one
+  cancel-in-progress: false
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: worker/src }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Follow live LAN events
+        working-directory: worker
+        env:
+          CBBL_URL: ${{ secrets.CBBL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: node src/lan-live.mjs

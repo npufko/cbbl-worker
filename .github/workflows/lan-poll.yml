@@ -1,8 +1,8 @@
-# LAN flow: follow live events. Every ~10 minutes, ask cbbl to sync any LAN event that is live
-# (list its Drive folder, refresh the bracket, dispatch new demos, promote finished series). With no
-# live event cbbl answers at once. Vercel Hobby cron runs only once a day, hence Actions.
-# GitHub runs schedules best-effort (often a few minutes late) and pauses them after 60 days without
-# a commit to this repo; "Sync now" on cbbl's /admin does the same thing on demand.
+# LAN flow: the backstop. Every ~10 minutes (best-effort: GitHub often runs it hours apart), ask cbbl
+# to sync any live LAN event. cbbl then makes sure the lan-live loop is running, and the loop keeps the
+# real cadence (a sync every 3 minutes). With no live event cbbl answers at once. Vercel Hobby cron
+# runs only once a day, hence Actions. GitHub pauses schedules after 60 days without a commit to this
+# repo; "Sync now" on cbbl's /admin does the same thing on demand.
 name: lan-poll
 on:
   schedule:
