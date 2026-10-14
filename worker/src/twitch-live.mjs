@@ -27,6 +27,8 @@ async function twitchToken() {
 
 main(async () => {
   const res = await fetch(`${CBBL_URL}/api/ingest/live`, { headers: cbbl, signal: AbortSignal.timeout(30_000) });
+  // 404: the cbbl deploy does not have the route yet (it ships with the profiles release). Not an error.
+  if (res.status === 404) { console.log('cbbl has no live route yet: skipping'); return; }
   if (!res.ok) throw new Error(`cbbl ${res.status}`);
   const handles = ((await res.json()).handles ?? []).map((h) => mask(String(h)));
   const live = [];
