@@ -35,7 +35,7 @@ reformatted is **not** redacted. Mask the form you print, or don't print it.
 ## Rule 3: what may and may not be logged
 
 **Never log:**
-- Secrets or anything built from them: `WORKER_SECRET`, `STEAM_REFRESH_TOKEN`, `STEAM_API_KEY`,
+- Secrets or anything built from them: `WORKER_SECRET`, `STEAM_REFRESH_TOKEN`, `STEAM_API_KEY`, `TWITCH_CLIENT_SECRET` (and its access token),
   `MATCH_AUTH_CODE`, `GOOGLE_DRIVE_API_KEY`, `DISCORD_MATCHES_WEBHOOK`, `CBBL_URL`, and any URL or
   header that contains one of them.
 - Bearer URLs: FACEIT presigned demo links (`X-Amz-Signature`), Valve replay URLs, Drive URLs with `key=`.

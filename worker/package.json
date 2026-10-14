@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "parse-job": "node src/parse-job.mjs",
-    "valve-discover": "node src/valve-discover.mjs"
+    "valve-discover": "node src/valve-discover.mjs",
+    "twitch-live": "node src/twitch-live.mjs"
   },
   "dependencies": {
     "steam-user": "5.3.0",

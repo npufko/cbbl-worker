@@ -1,0 +1,31 @@
+# The LIVE seal on member profiles: which members are streaming on Twitch. Scheduled here rather
+# than on Vercel (Hobby allows one cron a day). Public repo, so standard-runner minutes are free; the
+# job has no dependencies (Node's own fetch), so it skips npm ci.
+name: twitch-live
+on:
+  schedule:
+    # Best-effort: GitHub delays or drops scheduled runs under load, so a seal can lag a few minutes.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: twitch-live
+  cancel-in-progress: true # a newer check makes an older one pointless
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: worker }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Check who is live
+        working-directory: worker
+        env:
+          CBBL_URL: ${{ secrets.CBBL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+        run: node src/twitch-live.mjs
